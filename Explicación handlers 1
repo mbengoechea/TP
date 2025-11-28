@@ -1,0 +1,290 @@
+handle_create (líneas 40–131)
+•	41: declaración de la función handle_create(int socket_cliente, t_log* logger).
+•	42: usleep(retardo_operacion * 1000);
+o	Introduce un retardo configurable (en ms) antes de procesar la operación.
+•	43: log_info(logger, "CREATE");
+o	Logea la recepción de la operación CREATE.
+•	45: t_list* valores = recibir_paquete(socket_cliente);
+o	Recibe el paquete proveniente del cliente; devuelve una lista con los elementos enviados.
+•	46–51: if (!valores) { ... send error and return; }
+o	Verifica recepción; en caso de fallo registra error, envía un código de error (WTF_ERROR) y retorna.
+•	53–59: if (list_size(valores) != 3) { ... }
+o	Valida que el paquete tenga exactamente 3 elementos; si no, libera memoria, envía error y retorna.
+•	61–64: extrae los 3 elementos: nombre_archivo, nombre_tag y pointer a query_id; extrae valor query_id.
+o	Convierte/obtiene los tipos esperados.
+•	66: crear_directorio_file_tag(nombre_archivo, nombre_tag);
+o	Crea (si no existe) la estructura de directorios para ese file:tag.
+•	70: char* path = path_metadata(nombre_archivo, nombre_tag);
+o	Construye la ruta al metadata.cfg del file:tag.
+•	71–77: if (!path) { ... }
+o	Manejo de error por falta de memoria/creación de path; log y respuesta de error.
+•	80–89: FILE* fchk = fopen(path, "r"); if (fchk) { ... }
+o	Si ya existe metadata (archivo abierto con éxito), se rechaza la creación con ERROR_FILE_PREEXISTENTE.
+•	92: t_file_tag_metadata* meta = t_file_tag_metadata_create(nombre_archivo, nombre_tag);
+o	Construye en memoria la estructura metadata inicial (probablemente con size=0, state=WIP, blocks=NULL).
+•	93–100: if (!meta) { ... }
+o	Si falló la creación en memoria, respuesta de error y limpieza.
+•	103: t_file_tag_metadata_save(path, meta);
+o	Guarda en disco la metadata inicial (crea metadata.cfg con campos TAMAÑO, ESTADO, BLOCKS).
+•	106: t_config* cfg = config_create(path);
+o	Intenta cargar el archivo metadata.cfg con la biblioteca commons/config para verificar su validez.
+•	107–118: Validación explícita de que las propiedades TAMAÑO, ESTADO y BLOCKS existan. Si no, error y limpieza.
+•	119: config_destroy(cfg);
+o	Libera el objeto config.
+•	121: log_info(logger, "##%d File Creado %s:%s", query_id, nombre_archivo, nombre_tag);
+o	Log de éxito.
+•	123: t_file_tag_metadata_destroy(meta);
+o	Libera la metadata en memoria.
+•	124: free(path);
+o	Libera el string path.
+•	126–127: int resultado_ok = LISTO_OK; send(socket_cliente, &resultado_ok, sizeof(int), 0);
+o	Envía al cliente el resultado de éxito.
+•	129: list_destroy_and_destroy_elements(valores, free);
+o	Libera los elementos recibidos en el paquete.
+•	130: log_info(logger, "termine el create");
+o	Log final indicando que terminó el CREATE.
+•	131: fin de la función.
+Comentarios: El handler hace validaciones robustas, evita sobrescribir metadata existente y persiste la metadata inicial. Respeta retardo_operacion y hace logging detallado.
+________________________________________
+handle_truncate (líneas 134–221)
+•	135: declaración handle_truncate(...).
+•	136: usleep(retardo_operacion * 1000);
+o	Retardo antes de ejecutar.
+•	138: t_list* valores = recibir_paquete(socket_cliente);
+o	Recepción del paquete esperado.
+•	139–144: Validación básica: paquete no NULL y tamaño == 4; si falla, log, limpieza y envía un int 0 indicando error (aquí usan 0 como error simple).
+•	146–149: Obtiene nombre_archivo, nombre_tag, nuevo_tamanio y query_id desde la lista.
+•	151: log_info indicando intento de TRUNCATE con datos.
+•	153–167: Validación de que nuevo_tamanio sea múltiplo de block_size (excepto que 0 se permite). Si no es múltiplo, log de error, cleanup y envía WTF_ERROR.
+•	169: char* path_meta = path_metadata(...);
+o	Construye la ruta al metadata.
+•	170–175: Si no pudo construir path (NULL), enviar error (0), limpiar y retornar.
+•	178–184: Si path_meta no existe en FS (access(...) == -1), log error, limpiar y responder ERROR_FILE_INEXISTENTE.
+•	186–187: t_file_tag_metadata* meta = t_file_tag_metadata_create(...); t_file_tag_metadata_load(path_meta, meta);
+o	Crea la estructura meta y carga desde disco su contenido.
+•	190–197: Si el estado es COMMITED, rechaza la operación (no se permiten escrituras/truncados). Log, limpieza y responde ERROR_ESCRITURA_NO_PERMITIDA.
+•	199–205: Decide si agrandar o achicar: compara nuevo_tamanio con meta->size y llama a agrandar_file_tag o achicar_file_tag según corresponda; si igual, no hace nada.
+o	Estas funciones (no mostradas aquí) encapsulan la lógica de asignación/liberación de bloques.
+•	208: meta->size = nuevo_tamanio; // Actualiza el campo de tamaño
+•	209: t_file_tag_metadata_save(path_meta, meta); // Persiste metadata actualizada
+•	211: log_info de éxito indicando truncado.
+•	214–216: limpieza: destruir meta, free path_meta, destruir lista valores.
+•	219–220: enviar respuesta LISTO_OK al cliente.
+•	221: fin de función.
+Comentarios: Maneja validaciones primordiales (multiplo de bloque, existencia, estado COMMITED) y delega la lógica específica de reallocación de bloques a funciones auxiliares.
+________________________________________
+handle_tag (Clonar File:Tag) (líneas 224–349)
+•	225: declaración handle_tag.
+•	226: usleep(retardo_operacion * 1000);
+•	227: log_info(logger, "TAG");
+•	229: t_list* valores = recibir_paquete(socket_cliente);
+•	230–237: Si valores == NULL, log error y responder WTF_ERROR.
+•	239–246: Valida que se reciban 5 items (src_file, src_tag, dst_file, dst_tag, query_id); si no, error y respuesta WTF_ERROR.
+•	248–253: Extrae src_file, src_tag, dst_file, dst_tag y query_id.
+•	255: log_info describiendo la operación TAG origen->destino.
+•	258–260: Construcción de paths con path_metadata para origen y destino.
+•	260–267: Si alguno de los paths es NULL, log error, limpieza y respuesta WTF_ERROR.
+•	271–284: Chequeo de existencia del destino: intenta fopen(path_dst,"r"); si existe, cierra y responde ERROR_FILE_PREEXISTENTE (evita pisar).
+•	287–297: Carga metadata de origen: crea meta_src y carga su contenido; si falla crear meta_src, responde con error.
+•	300: crear_directorio_file_tag(dst_file, dst_tag);
+o	Crea los directorios del destino (no rompe si existen).
+•	301–311: Crea meta_dst en memoria; si malloc falla, limpieza y error.
+•	313–317: Clona campos relevantes: size, state=WIP (se fuerza WORK_IN_PROGRESS), block_count = block_count del source.
+•	319–328: Si el origen tiene bloques, aloca memoria en meta_dst->block_numbers y copia la lista; si malloc falla, deja la lista vacía.
+•	331: t_file_tag_metadata_save(path_dst, meta_dst);
+o	Persiste metadata destino.
+•	334–336: sincronizar_hardlinks_tag(dst_file, dst_tag, meta_dst);
+o	Esta línea (marcada “CORRECCIÓN CLAVE”) crea los hard links físicos en el nuevo directorio logical_blocks. Es la parte que hace que el tag clonado comparta físicamente los bloques (no duplica bytes).
+•	338: log_info de éxito de creación del tag.
+•	341–345: limpieza: destruir meta_src, meta_dst, free paths y liberar lista valores recibidos.
+•	347–348: enviar LISTO_OK al cliente.
+•	349: fin de función.
+Comentarios: TAG clona metadata y, muy importante, crea hard links a los bloques físicos (sin copiado) — esto permite compartir bloques y soporta deduplicación/optimización. El handler hace chequeo de no sobrescribir destino.
+________________________________________
+handle_commit (líneas 351–442)
+•	352: declaración handle_commit.
+•	353: usleep(retardo_operacion * 1000);
+•	354: log_info(logger, "commit time");
+•	355: t_list* valores = recibir_paquete(socket_cliente);
+•	356–361: Valida que haya 3 elementos; si no, log y responde WTF_ERROR.
+•	363–365: Extrae nombre_archivo, nombre_tag y query_id.
+•	367: char* path_meta = path_metadata(...);
+•	368: t_file_tag_metadata* meta = t_file_tag_metadata_create(...);
+•	371: (comentado) pthread_mutex_lock(&mutex_metadata);
+o	El código comenta un lock global de metadata; aquí se usa t_file_tag_metadata_load que internamente puede usar mutex_metadata según el comentario posterior.
+•	372: t_file_tag_metadata_load(path_meta, meta);
+o	Carga metadata desde disco.
+•	374–376: Si meta->state == COMMITED, log que ya estaba commited y no hace nada.
+•	377–425: Si no estaba commited, realiza la lógica de deduplicación:
+o	378–385: para cada bloque lógico del archivo:
+	Obtiene nro_bloque_actual.
+	Bloquea el mutex del bloque físico correspondiente (pthread_mutex_lock(&mutexes_bloques_fisicos[nro_bloque_actual])) antes de leer/hashear el bloque.
+	Calcula hash del bloque con calcular_hash_bloque (usa logger).
+	Desbloquea el mutex del bloque.
+o	386–387: si no se obtuvo hash, saltea.
+o	389: buscar_nro_bloque_por_hash(hash_actual, logger) — busca si ya existe un bloque con ese hash en índice (usa mutex_hash_index internamente).
+o	391–419: si encontró un bloque existente distinto (nro_bloque_existente != -1 y distinto de actual):
+	Log de deduplicación.
+	Construye path_logico (archivo logical block del file), path_fisico_nuevo (bloque que ya existe), path_fisico_viejo (bloque actual).
+	Realiza una “transacción” simple: unlink(path_logico) y link(path_fisico_nuevo, path_logico) — así el logical block ahora apunta al bloque físico existente.
+	Actualiza meta->block_numbers[i] = nro_bloque_existente.
+	Si el viejo bloque físico quedó sin links (obtener_link_count(path_fisico_viejo) <= 1), libera el bloque físico (liberar_bloque_fisico, que internamente ajusta bitmap con mutex_bitmap) y remueve su entrada del índice de hashes (con mutex_hash_index).
+	Libera los strings temporales.
+o	421–423: else if (nro_bloque_existente == -1) → no existe hash en índice: agregar_hash_a_indice(hash_actual, nro_bloque_actual, logger).
+o	424: free(hash_actual);
+•	426: fin del loop de deduplicación.
+•	428: meta->state = COMMITED; // marca como confirmado
+•	430: t_file_tag_metadata_save(path_meta, meta); // persiste cambios (se comenta que mutex_metadata es externo)
+•	431: log_info indicando Commit exitoso.
+•	434: (comentado) pthread_mutex_unlock(&mutex_metadata);
+•	436–438: limpieza: destruir meta, free path_meta y destruir lista valores.
+•	440–441: enviar LISTO_OK al cliente.
+•	442: fin de función.
+Comentarios: Commit hace deduplicación por contenido (hash) bajo protección de mutexes de bloque y mutex de índice de hashes. Actualiza metadata y libera bloques físicos no referenciados. Es la operación clave para consolidar writes y ahorrar espacio.
+________________________________________
+handle_pagina_bloque / READ_BLOCK (líneas 445–541)
+•	446: void handle_pagina_bloque(int socket_cliente, t_log* logger) {
+•	447: usleep(retardo_operacion * 1000); // Retardo general
+•	449: t_list* valores = recibir_paquete(socket_cliente);
+•	450: op_code error_code_respuesta = WTF_ERROR; // variable local (no siempre usada)
+•	452–458: Validación del paquete: debe existir y tener 4 elementos; si no, log y envía WTF_ERROR.
+•	460–463: Extrae query_id, nombre_archivo, nombre_tag y nro_bloque_logico.
+•	465: log_info indicando READ_BLOCK solicitado.
+•	467: char* path_meta = path_metadata(nombre_archivo, nombre_tag);
+•	469–476: Si path_meta no existe (access(...) == -1), envía ERROR_FILE_INEXISTENTE y limpia.
+•	478–480: Crea meta en memoria y carga metadata desde path_meta; luego libera path_meta.
+•	482–488: Si nro_bloque_logico fuera de rango ( <0 o >= block_count), error ERROR_FUERA_DE_LIMITE y retorna.
+•	491: int nro_bloque_fisico = meta->block_numbers[nro_bloque_logico];
+•	492: t_file_tag_metadata_destroy(meta);
+o	Ya obtuvo el número de bloque físico; libera metadata.
+•	495: pthread_mutex_lock(&mutexes_bloques_fisicos[nro_bloque_fisico]);
+o	Bloquea mutex específico del bloque físico para sincronizar acceso concurrente.
+•	498–500: Construye path_bloque_fisico (ruta al archivo físico block%04d.dat).
+•	501: usleep(retardo_aceso_bloque * 1000); // retardo de acceso a bloque
+•	503–510: fopen(path_bloque_fisico, "rb"); si fopen falla, log error, limpiar y enviar WTF_ERROR (nota: falta unlock en este caso — ver abajo).
+o	IMPORTANTE: cuando fopen falla, el mutex todavía está bloqueado: el código actual NO hace pthread_mutex_unlock antes de responder en el error; eso puede provocar deadlock si no se desbloquea. (Es un punto crítico a revisar).
+•	512: char* buffer_bloque = malloc(block_size);
+•	513: size_t bytes_leidos = fread(buffer_bloque, 1, block_size, fp);
+•	514: fclose(fp);
+•	516: pthread_mutex_unlock(&mutexes_bloques_fisicos[nro_bloque_fisico]);
+o	Desbloquea el mutex del bloque físico después de la lectura.
+•	518–525: Si bytes_leidos != block_size (lectura incompleta), log error, free(buffer) y envia WTF_ERROR.
+•	527: log_info indicando lectura exitosa.
+•	530–533: Arma un paquete con código LISTO_OK y agrega el buffer de tamaño block_size al paquete para enviarlo al worker.
+•	535–537: enviar_paquete(paquete_respuesta, socket_cliente); si falla, log de error (no cambia respuesta).
+•	539: free(buffer_bloque);
+•	540: list_destroy_and_destroy_elements(valores, free);
+•	541: fin de función.
+Comentarios y observaciones críticas:
+•	El bloqueo por mutex por bloque físico es correcto para serializar accessos concurrentes.
+•	Hay un bug potencial: si fopen falla (líneas 503–510), no se desbloquea pthread_mutex_unlock antes de retornar — eso puede dejar el mutex permanentemente bloqueado. Hay que desbloquearlo antes de send/error return.
+•	El handler envía el contenido del bloque binario completo (block_size) al cliente.
+________________________________________
+handle_write_block (líneas 544–634)
+•	544: void handle_write_block(...)
+•	545: usleep(retardo_operacion * 1000);
+•	547: int resultado = WTF_ERROR; // valor por defecto a devolver
+•	548–549: t_file_tag_metadata* meta = NULL; char* path_meta = NULL; // inicializaciones
+•	551: t_list* valores = recibir_paquete(socket_cliente);
+•	552: comentario: se espera file, tag, nro_bloque_logico, contenido, query_id
+•	553–557: si paquete inválido -> cleanup y enviar resultado (WTF_ERROR) y return.
+•	559–563: extrae nombre_archivo, nombre_tag, nro_bloque_logico, contenido (puntero), query_id.
+•	565: path_meta = path_metadata(...); // construye path metadata
+•	566–571: si path_meta es NULL -> log error, limpiar, enviar error y return.
+•	574–580: si path_meta no existe en disco -> enviar ERROR_FILE_INEXISTENTE y return.
+•	584–586: crea meta y carga metadata desde disco.
+•	588–596: valida que meta->state != COMMITED; si está COMMITED, respuesta ERROR_ESCRITURA_NO_PERMITIDA.
+•	599–607: valida índice de bloque lógico: si fuera de rango, responde ERROR_FUERA_DE_LIMITE.
+•	610: int rc = write_block_file_tag(nombre_archivo, nombre_tag, nro_bloque_logico, block_size, contenido, meta, query_id);
+o	Llama a una función auxiliar que ejecuta la escritura: puede ser escritura directa si el bloque ya es exclusivo o Copy-on-Write si el bloque está deduplicado/shared. Esa función se encarga del locking por bloque, del manejo del bitmap, de crear/actualizar hardlinks y de loguear el éxito.
+•	612–627: interpreta el rc devuelto por write_block_file_tag:
+o	rc == 0 → éxito: guarda metadata (si write creó o cambió algo), resultado = LISTO_OK.
+o	rc == ERROR_ESPACIO_INSUFICIENTE → resultado específico.
+o	rc == ERROR_FUERA_DE_LIMITE → resultado específico.
+o	rc == ERROR_ESCRITURA_NO_PERMITIDA → resultado específico.
+o	cualquier otro rc → resultado WTF_ERROR y log de error genérico.
+•	629–631: limpieza: destruir meta, free(path_meta), destruir lista valores.
+•	633: send(socket_cliente, &resultado, sizeof(int), 0);
+o	Envía el resultado al cliente (códigos definidos más arriba).
+•	634: fin de función.
+Comentarios:
+•	La lógica compleja del write (CoW, asignación de nuevo bloque físico, actualización de hardlinks, hashing, etc.) está delegada a write_block_file_tag; este handler valida y maneja el flujo general y la persistencia de metadata si hubo cambios.
+•	Buen manejo de errores y códigos específicos.
+________________________________________
+handle_delete (líneas 637–861)
+•	638: void handle_delete(...)
+•	639: usleep(retardo_operacion * 1000);
+•	640: log_info(logger, "DELETE");
+•	642: t_list* args = recibir_paquete(socket_cliente);
+•	643–649: Validación paquete; si inválido, log y enviar WTF_ERROR.
+•	652–654: extrae nombre_archivo, nombre_tag y query_id.
+•	656: log_info indicando operación DELETE.
+•	658–665: Protege un tag especial initial_file:BASE — si se intenta borrar, rechaza con WTF_ERROR.
+•	667–669: inicializa dir_tag y path_meta a NULL.
+•	670: dir_tag = string_from_format("%s/files/%s/%s", punto_montaje, nombre_archivo, nombre_tag);
+o	Path al directorio del tag.
+•	671–676: si dir_tag NULL (sin memoria), error y return.
+•	679: path_meta = path_metadata(...);
+•	680–686: si path_meta NULL, error y return.
+•	689–697: si path_meta no existe en disco, responde ERROR_FILE_INEXISTENTE.
+•	699–707: crea meta en memoria y valida malloc; si falla, error y return.
+•	712: t_file_tag_metadata_load(path_meta, meta);
+o	Carga metadata. Comentario: usa mutex_metadata internamente.
+•	715–723: prepara copia local de la lista de bloques (blocks_copy). Bloquea mutex_metadata antes de acceder a los datos y eliminar la metadata en disco:
+o	718: pthread_mutex_lock(&mutex_metadata);
+o	719–723: si blocks_count>0, aloca blocks_copy y memcpy; si malloc falla, desbloquea mutex, limpia y retorna error.
+•	736–740: intenta remove(path_meta): elimina metadata en disco (si falla, hace warning pero continúa).
+•	741: pthread_mutex_unlock(&mutex_metadata);
+•	744: t_file_tag_metadata_destroy(meta);
+o	libera estructura meta porque ya tiene copia blocks_copy con los bloques.
+•	747–792: si blocks_copy existe y blocks_count>0, iterar por cada bloque lógico y:
+o	749: int nro_bloque_fisico = blocks_copy[i];
+o	751–753: construye path_bloque_logico y path_bloque_fisico.
+o	754–759: chequeo de memoria para strings temporales.
+o	762–786: si unlink(path_bloque_logico) == 0 (hard link lógico eliminado):
+	log_info indicando eliminación.
+	if (obtener_link_count(path_bloque_fisico) <= 1) { liberar_bloque_fisico(fs, nro_bloque_fisico); actualizar índice de hashes (blocks_hash_index_remove_entry_for_block) } else log_debug que todavía referenciado.
+o	Si unlink falla, log warning.
+o	libera strings temporales.
+•	791: free(blocks_copy);
+•	795–820: intenta eliminar dir_logical (dir_tag/logical_blocks) de forma recursiva si quedan archivos residuales:
+o	abre directorio, itera sobre entradas y unlink cada archivo; luego closedir y rmdir el dir_logical.
+o	logs y manejo de errores si no puede eliminar.
+•	822–851: intenta rmdir(dir_tag) (el directorio del tag); si falla, intenta limpiar recursivamente su contenido (abre d2 y elimina contenidos) y vuelve a rmdir; logs de advertencia si no pudo eliminar.
+•	854–857: limpia dir_tag, path_meta y lista args.
+•	859–860: envía LISTO_OK al cliente.
+•	861: fin de función.
+Comentarios:
+•	La función borra metadata, elimina hard links lógicos y libera bloques físicos cuando ya no tienen más referencias. Actualiza índice de hashes al liberar bloques.
+•	Protege con mutex_metadata al leer y hacer visible la eliminación de metadata.
+•	Realiza limpieza recursiva para evitar dejar residuos en disco; maneja errores con logs.
+•	Buena robustez general.
+________________________________________
+handle_handshake_storage (líneas 863–881)
+•	864: void handle_handshake_storage(int socket_cliente, t_log* logger) {
+•	865: (usleep comentado) // no aplica el retardo o quedó comentado.
+•	867: log_info(logger, "Recibí HANDSHAKE_STORAGE de un Worker");
+•	868: char* id = recibir_nombre(socket_cliente, logger);
+o	Recibe un nombre/ID enviado por el worker (string).
+•	870: agregar_worker(id, socket_cliente);
+o	Registra el worker en diccionario_workers (función definida en otro lugar).
+•	872–881: Prepara un paquete de respuesta:
+o	872: t_paquete* paquete = malloc(sizeof(t_paquete));
+o	873: paquete->codigo_operacion = HANDSHAKE_WORKER; // código para handshake
+o	874: crear_buffer(paquete);
+o	876: cargar_int_buffer(paquete->buffer, block_size); // envía block_size al worker
+o	878: enviar_paquete(paquete, socket_cliente);
+o	880: eliminar_paquete(paquete);
+•	881: fin de función.
+Comentarios: El handshake sirve para registrar workers y enviarles configuración inicial (block_size). agregar_worker debe gestionar el diccionario y posiblemente inicializar estructuras por worker.
+________________________________________
+Observaciones generales y puntos críticos detectados
+•	Bloqueos y concurrencia:
+o	El código usa mutex_metadata, mutex_hash_index, mutex_bitmap y mutexes_bloques_fisicos[] para sincronización. En general están bien aplicados (bloque por bloque para accesos físicos, mutex global para metadata/índice).
+o	Sin embargo, detecté un posible bug en handle_pagina_bloque: si fopen falla tras haber tomado el mutex del bloque físico (línea ~503), el código no hace pthread_mutex_unlock antes de retornar con error. Eso puede producir deadlocks posteriores en accesos a ese bloque. Recomendación: asegurarse de desbloquear antes de cualquier return/error tras bloquear un mutex.
+•	Manejo de errores:
+o	Los handlers suelen responder con códigos específicos (LISTO_OK, ERROR_FILE_INEXISTENTE, ERROR_FUERA_DE_LIMITE, ERROR_ESCRITURA_NO_PERMITIDA, ERROR_ESPACIO_INSUFICIENTE, WTF_ERROR...). Ese mapeo permite al cliente interpretar la causa.
+•	Delegación de responsabilidad:
+o	Las operaciones complejas (asignación/liberación de bloques, CoW, hashing, índice de hashes, sync hardlinks) están delegadas a funciones auxiliares (agregar_hash_a_indice, write_block_file_tag, liberar_bloque_fisico, calcular_hash_bloque, etc.). El handler valida, orquesta y persiste metadata.
+•	Logs: El código registra mucha información útil (info, error, warning, debug) lo cual es muy valioso para depuración.
+
