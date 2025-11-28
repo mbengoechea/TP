@@ -1,0 +1,792 @@
+Estructuras principales
+1.	t_storage_fs (la estructura principal del filesystem)
+•	Campos relevantes (resumen):
+o	uint32_t fs_size: tamaño total del FS en bytes.
+o	uint32_t block_size: tamaño de cada bloque físico en bytes.
+o	uint32_t block_count: cantidad total de bloques físicos.
+o	t_bitarray* bitmap: bitarray que representa bloques libres/ocupados.
+o	char bitmap_path[MAX_BLOCK_PATH], superblock_path[], hash_index_path[]: rutas de archivos en disco.
+o	char physical_blocks_dir[MAX_BLOCK_PATH]: directorio donde están los archivos de bloques físicos.
+o	char files_dir[MAX_BLOCK_PATH]: directorio donde están los archivos lógicos (files/<file>/<tag>/metadata).
+•	Propósito:
+o	Representa la configuración y estado global del almacenamiento en memoria.
+o	Contiene el bitarray para encontrar/gestionar bloques libres.
+o	Tiene las rutas para persistencia (bitmap, superblock, hash index, directorio de bloques, directorio files).
+Cómo se usa:
+•	Se instancia y rellena al arrancar la Storage (función setear_o_usar_fs en storage.c).
+•	cant_bloques = fs_size / block_size y se reserva un array de mutexes por bloque físico.
+•	Las funciones reservar_bloque_fisico() y liberar_bloque_fisico() operan sobre el bitmap y actualizan este struct.
+2.	t_file_tag_metadata (metadata por File:Tag)
+•	Campos principales:
+o	char file_name[MAX_FILE_NAME]
+o	char tag_name[MAX_TAG_NAME]
+o	uint32_t size: tamaño actual del File:Tag en bytes
+o	t_file_tag_state state: enum { WORK_IN_PROGRESS, COMMITED }
+o	int* block_numbers: array dinámico con índices de bloques físicos asignados
+o	uint32_t block_count: cantidad de bloques asignados
+•	Propósito:
+o	Representa la metadata de un par file:tag — su tamaño, estado y qué bloques físicos ocupan.
+o	Se guarda en disco como un archivo metadata (se construye BLOCKS=[...], SIZE=..., STATE=...).
+•	Funciones relacionadas:
+o	t_file_tag_metadata_create(...) — inicializa la estructura en memoria.
+o	t_file_tag_metadata_save(path, m) — serializa y graba la metadata en disk (usa mutex_metadata).
+o	t_file_tag_metadata_destroy(m) — libera memoria (block_numbers y struct).
+3.	t_worker
+•	Campos:
+o	char* id (identificador de worker)
+o	int socket (socket asociado)
+•	Propósito:
+o	Mantener lista/diccionario de workers conectados al Storage (diccionario_workers).
+o	Se usa para handshake y envío de info como block_size.
+Arquitectura en disco (layout)
+•	Punto de montaje (punto_montaje) — raíz del FS configurado.
+•	Archivos y directorios creados bajo ese punto:
+o	bitmap.bin (archivo con bitmap persistente)
+o	superblock.config (config con parámetros fs_size/block_size)
+o	blocks_hash_index.config (índice/hash de bloques — para mapeos/referencias)
+o	physical_blocks/ — directorio con archivos de bloques físicos (cada bloque físico representado por un archivo)
+o	files/ — directorio con la estructura lógica de files:
+	files/<nombre_archivo>/<nombre_tag>/metadata (archivo de metadata por File:Tag)
+	posiblemente otras estructuras lógicas (archivos temporales, etc.)
+•	Comportamiento de fresh_start:
+o	Si fresh_start = TRUE el código limpia ciertos estados anteriores (se preserva superblock según comentarios).
+Relación entre metadata, bitmap y bloques físicos
+•	Cuando se necesita espacio para un File:Tag:
+o	Se llaman funciones que buscan bits libres en bitmap (reservar_bloque_fisico).
+o	El índice de bloque físico se añade al array block_numbers de t_file_tag_metadata.
+o	Se crea el bloque físico correspondiente en physical_blocks (p. ej. archivo block<N>).
+o	Cuando se libera espacio, se desasignan bloques y se actualiza bitmap y metadata.
+•	El campo block_numbers almacena índices (enteros) que son usados para leer/escribir en bloques físicos.
+•	Existe un archivo blocks_hash_index.config que hace de índice adicional entre bloques y rutas lógicas (útil para búsquedas inversas o reconstrucción).
+Sincronización / concurrencia
+•	mutex_bitmap: protege operaciones sobre el bitmap para evitar races al reservar/liberar bloques.
+•	mutex_metadata: protege lecturas/escrituras de archivos de metadata (t_file_tag_metadata_save/load).
+•	mutex_hash_index: protege el acceso al archivo/estructura hash index.
+•	mutexes_bloques_fisicos: array de mutexes, uno por cada bloque físico, para serializar accesos al contenido de cada bloque individual (lectura/escritura de un bloque).
+•	Además hay un mutex para diccionario de workers (mutex_workers).
+•	Las funciones de t_file_tag_metadata_save usan pthread_mutex_lock(&mutex_metadata) al grabar.
+Funciones API que operan sobre estas estructuras (prototipos en storage/include/storage.h)
+•	reservar_bloque_fisico(t_storage_fs* fs)
+•	liberar_bloque_fisico(t_storage_fs* fs, int bloque)
+•	crear_logical_block(t_storage_fs* fs, char* logical_path, int bloque_fisico)
+•	eliminar_logical_block(char* logical_path)
+•	actualizar_metadata_config(char* path_metadata, int nuevo_tamanio, char* blocks_str)
+•	path_metadata(char* file, char* tag)
+•	asignar_bloques_logicos(...) y desasignar_bloques_logicos(...) — funciones de alto nivel que actualizan metadata y bitmap según tamaño nuevo. Estas funciones implementan la lógica de CREATE / TRUNCATE / WRITE / DELETE / COMMIT en storage.
+Flujo típico de operaciones (resumen práctico)
+•	CREATE file:tag:
+o	crear directorio files/<file>/<tag>
+o	crear metadata inicial (size=0, state=WORK_IN_PROGRESS, block_numbers=NULL)
+o	guardar metadata en disco.
+•	WRITE/TRUNCATE:
+o	calcular cuántos bloques necesita el nuevo tamaño
+o	asignar/desasignar bloques físicos (bitmap + crear/eliminar archivos en physical_blocks)
+o	actualizar block_numbers y block_count en la metadata
+o	guardar metadata (con mutex_metadata)
+•	COMMIT:
+o	cambiar state -> COMMITED en metadata y persistir
+o	posiblemente acciones de sincronización con master/otros.
+•	DELETE:
+o	leer metadata, liberar los bloques indicados en bitmap y borrar entradas en blocks_hash_index
+o	eliminar directorio files/<file>/<tag> y su metadata.
+Dónde mirar en el código para detalles concretos
+•	Definición: storage/include/structs.h
+•	Guardado y formato de metadata: storage/src/structs.c (t_file_tag_metadata_save, load y destroy)
+•	Inicialización de FS y paths/bitmap: storage/src/storage.c (setear_o_usar_fs, variables globales, creación de mutexes por bloque)
+•	Handlers de protocolo (lo que responde a las llamadas de los workers/master): storage/src/handlers.c
+•	main y lectura de config: storage/src/main.c (inicializa punto_montaje, block_size, fs_size y llama a setear_o_usar_fs)
+Notas adicionales / advertencias
+•	La metadata guarda los índices de bloques físicos (no punteros a contenido). El contenido real está en archivos de physical_blocks.
+•	Hay protección por mutex a distintos niveles para evitar condiciones de carrera: bitmap global, metadata por archivo y mutex por bloque físico para accesos concurrentes al contenido.
+•	El código hace uso de commons/bitarray para gestionar el bitmap, y de archivos config para persistir la metadata.
+
+
+•	#define MAX_BLOCK_PATH 256
+o	Macro que define la longitud máxima de rutas relacionadas con bloques (buffer estático para rutas).
+•	#define MAX_FILE_NAME 128
+o	Tamaño máximo en caracteres para el nombre lógico de un archivo.
+•	#define MAX_TAG_NAME 64
+o	Tamaño máximo para el nombre de una tag.
+•	// Estados de un File:Tag
+o	Comentario explicativo.
+•	typedef enum { WORK_IN_PROGRESS, COMMITED } t_file_tag_state;
+o	Enum que modela el estado de un File:Tag:
+	WORK_IN_PROGRESS: cambios aún no "commitados" (permiten escrituras).
+	COMMITED: estado final, probablemente lectura permitida y no más escrituras.
+•	// Estructura principal del FileSystem
+o	Comentario explicativo.
+•	typedef struct { uint32_t fs_size; // Tamaño total del FS (bytes) uint32_t block_size; // Tamaño de cada bloque físico (bytes) uint32_t block_count; // Cantidad total de bloques físicos t_bitarray* bitmap; // Bitarray de bloques físicos char bitmap_path[MAX_BLOCK_PATH]; char superblock_path[MAX_BLOCK_PATH]; char hash_index_path[MAX_BLOCK_PATH]; char physical_blocks_dir[MAX_BLOCK_PATH]; char files_dir[MAX_BLOCK_PATH]; } t_storage_fs;
+o	Definición de t_storage_fs, la estructura que representa el filesystem en memoria:
+	fs_size: tamaño total del filesystem en bytes (configuración).
+	block_size: tamaño de cada bloque físico en bytes (configuración).
+	block_count: número total de bloques físicos (normalmente fs_size / block_size).
+	bitmap: puntero a t_bitarray que representa qué bloques están libres/ocupados.
+	bitmap_path: ruta al archivo persistente del bitmap.
+	superblock_path: ruta al archivo superblock (config con parámetros del FS).
+	hash_index_path: ruta al archivo con el índice/hash de bloques (blocks_hash_index).
+	physical_blocks_dir: ruta al directorio con los archivos de bloques físicos.
+	files_dir: ruta al directorio raíz donde se almacenan los files lógicos (files/...).
+o	Observaciones:
+	Esta estructura agrupa estado en memoria y rutas de persistencia.
+	block_count y bitmap deben mantenerse coherentes; muchas funciones del módulo trabajan con este struct.
+•	// Metadata de un File:Tag
+o	Comentario.
+•	typedef struct { char file_name[MAX_FILE_NAME]; char tag_name[MAX_TAG_NAME]; uint32_t size; // Tamaño del File:Tag (bytes) t_file_tag_state state; // Estado (WORK_IN_PROGRESS/COMMITED) int* block_numbers; // Array con índices de bloques físicos uint32_t block_count; // Cantidad de bloques asignados } t_file_tag_metadata;
+o	Definición de t_file_tag_metadata: metadata que describe un file:tag lógico.
+	file_name: nombre del archivo lógico (fijo en buffer estático).
+	tag_name: nombre de la tag asociada al archivo.
+	size: tamaño actual en bytes del file:tag — usado para bounds en lectura/escritura.
+	state: estado (WORK_IN_PROGRESS o COMMITED).
+	block_numbers: puntero dinámico a un array de int; cada int es el índice de un bloque físico asignado.
+	block_count: cantidad de entradas válidas en block_numbers.
+o	Observaciones:
+	block_numbers es dinámico: debe ser malloc/free apropiadamente. Cuando block_count == 0, block_numbers puede ser NULL.
+	Este struct se serializa en disco (ver funciones de save/load en structs.c) y es la fuente de verdad para dónde leer/escribir datos lógicos.
+	size y block_count deben mantenerse sincronizados según block_size (p. ej. block_count = ceil(size / block_size)).
+•	typedef struct{ char* id; int socket; } t_worker;
+o	Estructura simple para representar un worker conectado:
+	id: identificador del worker (cadena dinámica).
+	socket: descriptor del socket asociado.
+o	Se usa para llevar una lista/diccionario de workers conectados al Storage y enviarles handshakes/info.
+•	t_file_tag_metadata* t_file_tag_metadata_create( char* nombre_archivo, char* nombre_tag);
+o	Prototipo de función que crea/inicializa una estructura t_file_tag_metadata en memoria, asignando file_name y tag_name y valores iniciales (size=0, state=WORK_IN_PROGRESS, block_numbers=NULL, block_count=0).
+o	Implementada en storage/src/structs.c.
+•	void t_file_tag_metadata_save( char* path, t_file_tag_metadata* m);
+o	Prototipo para guardar/serializar la metadata en disco en la ruta path. Debe guardar SIZE=..., STATE=..., BLOCKS=[...], etc.
+o	En el código la implementación usa mutex_metadata para sincronizar escrituras.
+•	void t_file_tag_metadata_destroy(t_file_tag_metadata* m);
+o	Libera memoria asociada a la metadata (free block_numbers y free del struct).
+•	void t_file_tag_metadata_load(char* path, t_file_tag_metadata* m);
+o	Carga desde disco la metadata existente en path y rellena la estructura apuntada por m.
+o	Observación: firma sugiere que m ya está asignado y la función lo rellena; revisar implementación para ver si mallocs internos son hechos.
+•	void agregar_worker(char* worker_id, int socket_fd);
+o	Prototipo para agregar un worker al diccionario/lista de workers. Debe almacenar (id, socket).
+•	void quitar_worker_por_socket(int socket_fd);
+o	Elimina worker asociado a un socket (útil al detectar desconexión).
+•	void free_worker(void* ptr);
+o	Función auxiliar para liberar memory de un t_worker (útil al usar listas y pasar como callback).
+•	#endif
+o	Cierre del include guard.
+Notas generales y consideraciones prácticas
+•	Tamaños de buffers: file_name y tag_name son buffers estáticos con longitudes limitadas. El código que copie nombres debe asegurarse de no desbordarlos (strncpy, etc.).
+•	block_numbers es un array dinámico de int. Hay que usar correctamente malloc/realloc/free y actualizar block_count.
+•	Serialización y concurrencia:
+o	El guardado/lectura de metadata en disco está sincronizado externamente (mutex_metadata). No verás el mutex aquí porque está declarado extern en otros módulos (main.c / storage.c).
+o	El bitmap se gestiona con t_bitarray* y operaciones atómicas protegidas por mutex_bitmap.
+•	Coherencia entre size y block_count: el código tiene funciones (asignar_bloques_logicos/desasignar_bloques_logicos) que se encargan de garantizar que la metadata refleje correctamente los bloques asignados para el tamaño solicitado.
+•	Uso de rutas: t_storage_fs contiene rutas y directorios; la función setear_o_usar_fs construye esas rutas y crea directorios/archivos según fresh_start.
+Explicación detallada, paso a paso (t_file_tag_metadata_save)
+1.	pthread_mutex_lock(&mutex_metadata);
+•	Se adquiere el mutex global de metadata para evitar concurrencia entre lecturas/escrituras de metadata. Esto asegura que la operación sea atómica respecto a otras cargas/guardados de metadata.
+2.	const char* estado_str = ...;
+•	Se elige la representación en texto del estado (WORK_IN_PROGRESS o COMMITED) para escribirlo en el archivo.
+3.	Construcción del string BLOCKS=[...]
+•	Calcula una capacidad tentativa:
+o	size_t cap = 2 + block_count * 12;
+o	Razonamiento: mínimo "[]" (2) y se reserva ~12 bytes por bloque (espacio heurístico para el número y la coma).
+•	Reserva blocks_str con malloc(cap >= 3 ? cap : 3) para asegurar al menos espacio para "[]\0".
+•	Si block_count == 0 => blocks_str = "[]".
+•	Si hay bloques:
+o	Inicia con '[' y luego itera i sobre m->block_count.
+o	Para cada bloque usa snprintf para añadir "n," o "n" (sin coma en el último).
+o	Verifica retorno de snprintf (n < 0 o n >= espacio restante) → en ese caso logea error, libera blocks_str y desbloquea mutex retornando (previene overflow).
+o	Al final escribe ']' y termina con '\0'.
+•	Comentario: la función evita overflow con comprobaciones en cada snprintf, pero la capacidad inicial es heurística (12 por bloque).
+4.	Construcción del texto final
+•	size_t need = 64 + strlen(blocks_str);
+o	Reserva un buffer texto con margen fijo + tamaño del blocks_str.
+•	snprintf(texto, need, "TAMAÑO=%u\nESTADO=%s\nBLOCKS=%s\n", ...)
+o	Si snprintf indica overflow (n < 0 o n >= need) → log de error y retorno liberando recursos.
+•	Libera blocks_str (ya incorporado en texto).
+5.	Creación de tmp_path
+•	Construye tmp_path = path + ".tmp" (alloc plen+5).
+•	Esto prepara la escritura en un archivo temporal para luego renombrarlo atómicamente al path final.
+6.	fopen(tmp_path, "w") y fwrite(texto)
+•	Abre el archivo temporal para escritura.
+•	Intenta escribir todo el contenido (writ == want).
+•	Si write corto → log, fclose, unlink(tmp_path), liberar, retornar.
+7.	fflush + fsync + fclose
+•	fflush(f) para volcar buffers de stdio; fsync(fileno(f)) para asegurar que datos alcanzaron disco antes de cerrar.
+•	Luego cierra el FILE.
+8.	rename(tmp_path, path)
+•	Renombra el archivo temporal al nombre final. rename es atómico en archivos del mismo filesystem: garantiza que lectores vean siempre o la versión anterior completa o la nueva completa (siempre que los lectores no tengan abiertos los descriptors anteriores y coordinen con el mutex).
+•	Si falla rename → log, unlink(tmp_path), liberar, retornar.
+9.	Liberación y pthread_mutex_unlock(&mutex_metadata)
+•	Libera tmp_path y texto, y finalmente libera el mutex.
+Puntos importantes de la implementación (por qué se hace así)
+•	Mutex: protege contra lecturas/escrituras concurrentes de metadata y evita races.
+•	Uso de archivo temporal + rename: patrón clásico para reemplazo atómico del archivo de metadata (evita archivos parcialmente escritos si hay fallo durante escritura).
+•	fflush + fsync: asegura persistencia de datos a disco antes del rename; mejora durabilidad frente a caídas.
+•	Comprobaciones de overflow y errores: el código valida snprintf y malloc, y en caso de error limpia y sale.
+Posibles mejoras / riesgos / observaciones
+•	Capacidad heurística para blocks_str (cap = 2 + block_count * 12): funciona en la práctica si los números de bloque son de magnitud moderada. Si los índices de bloque crecen mucho (más dígitos) o block_count es grande, podría ser insuficiente: la función detecta overflow durante snprintf y aborta, pero sería más robusto calcular exactamente los dígitos necesarios o usar un buffer dinámico con realloc cuando haga falta.
+•	Alcance del lock: la función adquiere mutex_metadata antes de construir blocks_str y texto; esto hace que otras operaciones de metadata esperen mientras se formatea la cadena y se realizan mallocs. Para reducir latencia de bloqueo se podría:
+o	Formatear bloques/texto fuera del lock (operación in-memory, sin acceso compartido), adquirir mutex justo antes de abrir/renombrar el archivo y escribir (manteniendo coherencia), o
+o	Construir todo y luego adquirir lock sólo para la parte de I/O/persistencia. Sin embargo, mantener el lock durante todo el proceso simplifica la lógica y evita que otro hilo lea metadata intermedia.
+•	Hold de mutex durante fsync/rename: fsync puede ser relativamente lento; mantener el mutex durante ese tiempo penaliza concurrencia. Evaluar trade-off entre seguridad y concurrencia.
+•	Uso de funciones C estándar: el patrón tmp+rename+fsync es apropiado y portable; alternativas modernas son O_TMPFILE / renameat2 cuando se quieren garantías adicionales.
+•	manejo de errores: el código hace buen trabajo liberando recursos y desbloqueando antes de retornar en la mayoría de los caminos de error.
+Explicación breve de t_file_tag_metadata_load (pasos clave)
+•	pthread_mutex_lock(&mutex_metadata);
+•	Usa config_create(path) para parsear archivo de metadata (formato TAMAÑO/ESTADO/BLOCKS).
+•	Valida que existan las claves "TAMAÑO", "ESTADO" y "BLOCKS".
+•	m->size <- config_get_int_value("TAMAÑO").
+•	m->state <- compara ESTADO con "WORK_IN_PROGRESS" para decidir enum; si no igual, considera COMMITED.
+•	Libera cualquier block_numbers previa y pone block_numbers=NULL y block_count=0.
+•	Obtiene array de strings arr = config_get_array_value(cfg, "BLOCKS") donde arr es NULL o lista terminada en NULL.
+o	Cuenta elementos c; si c>0, malloc(sizeof(int)*c) para m->block_numbers.
+o	Convierte cada arr[i] con atoi a int y lo guarda en m->block_numbers[i]; libera arr[i] y al final free(arr).
+o	Actualiza m->block_count = c.
+•	config_destroy(cfg) y pthread_mutex_unlock(&mutex_metadata).
+•	Maneja errores de apertura, claves faltantes y falta de memoria, liberando y retornando.
+Formato resultante en disco (ejemplo)
+•	Un archivo metadata típico tendrá este aspecto: TAMAÑO=4096 ESTADO=WORK_IN_PROGRESS BLOCKS=[1,3,17,42]
+•	Este formato es el que save produce y load espera.
+Notas sobre concurrencia y coherencia
+•	El mutex_metadata serializa las operaciones save/load, por lo tanto no hay condiciones de carrera entre threads que carguen y guarden la metadata si todos usan ese mutex.
+•	Lectores externos que no respeten mutex pueden ver la metadata mientras se está renombrando o justamente antes/después; el uso de rename atómico reduce ventanas de inconsistencia a nivel de sistema de archivos.
+
+
+Copilot said: Voy a trazar un ejemplo concreto (con
+Voy a trazar un ejemplo concreto (con números y contenido de archivos) que muestre exactamente cómo cambian en memoria y en disco:
+•	el array meta->block_numbers del File:Tag,
+•	el bitmap (bits libres/ocupados),
+•	y el archivo de metadata en disco (contenido que guarda t_file_tag_metadata_save).
+Me baso en el comportamiento real del código que revisamos (funciones: asignar_bloques_logicos / agrandar_file_tag / desasignar_bloques_logicos / achicar_file_tag / write_block_file_tag / reservar_bloque_fisico / liberar_bloque_fisico y t_file_tag_metadata_save).
+Supuestos iniciales (para el ejemplo)
+•	punto_montaje = /mnt/storage
+•	block_size = 1024 bytes
+•	bloques físicos totales (cant_bloques) = > 10 (hay espacio)
+•	Bloque físico 0 existe y está inicializado con ceros.
+•	Archivo lógico: file = "myfile", tag = "BASE".
+•	Estado inicial de la metadata de myfile:BASE:
+o	size = 1024 (1 bloque)
+o	block_count = 1
+o	block_numbers = [0] // el único bloque lógico apunta al bloque físico 0
+o	state = WORK_IN_PROGRESS
+•	Bitmap inicial (bits por índice de bloque físico): bit0 = 1 (ocupado), resto = 0 (libres).
+•	En disco hay:
+o	/mnt/storage/physical_blocks/block0000.dat (bloque físico 0)
+o	/mnt/storage/files/myfile/BASE/logical_blocks/000000.dat -> hardlink a physical_blocks/block0000.dat
+o	/mnt/storage/files/myfile/BASE/metadata.cfg con: TAMAÑO=1024 ESTADO=WORK_IN_PROGRESS BLOCKS=[0]
+Operación 1 — TRUNCATE (agrandar) a 3072 bytes (3 bloques)
+•	Qué hace el código:
+o	Se calcula nuevos_bloques = ceil(3072/1024) = 3.
+o	Se observa que nuevos_bloques (3) > meta->block_count (1), por eso se agranda.
+o	Se llaman funciones para actualizar la metadata en memoria: agrandar_file_tag (o asignar_bloques_logicos en otra ruta).
+o	agrandar_file_tag:
+	realloc del array meta->block_numbers a tamaño 3.
+	Para i desde 1 hasta 2 (los nuevos índices) pone meta->block_numbers[i] = 0 (apunta al bloque físico 0).
+	Crea hard links en disk:
+	link(/mnt/storage/physical_blocks/block0000.dat, /mnt/storage/files/myfile/BASE/logical_blocks/000001.dat)
+	link(/mnt/storage/physical_blocks/block0000.dat, /mnt/storage/files/myfile/BASE/logical_blocks/000002.dat)
+	actualiza meta->block_count = 3.
+o	asignar_bloques_logicos (si se usa) también marca en bitmap el bit 0 (pero ya estaba marcado) y hace msync(bitmap).
+o	Finalmente handle_truncate / quien controle la operación guarda metadata en disco con t_file_tag_metadata_save (tmp + rename).
+•	Estado resultante (en memoria):
+o	meta->size = 3072
+o	meta->block_count = 3
+o	meta->block_numbers = [0, 0, 0]
+o	meta->state = WORK_IN_PROGRESS
+•	Bitmap:
+o	bit0 = 1 (ocupado)
+o	resto bits = 0
+•	Hardlinks (en disco):
+o	/mnt/storage/physical_blocks/block0000.dat
+o	logical_links:
+	/mnt/storage/files/myfile/BASE/logical_blocks/000000.dat -> link a block0000.dat
+	/mnt/storage/files/myfile/BASE/logical_blocks/000001.dat -> link a block0000.dat
+	/mnt/storage/files/myfile/BASE/logical_blocks/000002.dat -> link a block0000.dat
+o	El link count (st_nlink) de block0000.dat = 1 (physical_blocks file) + 3 (los 3 logical_blocks) = 4
+•	metadata.cfg (guardado por t_file_tag_metadata_save) ahora contiene (ejemplo): TAMAÑO=3072 ESTADO=WORK_IN_PROGRESS BLOCKS=[0,0,0] (se escribió vía tmp + rename; bitmap se sincronizó con msync si se marcó el bit 0)
+Observación importante: agrandar/Asignar no solicita nuevos bloques físicos libres: los nuevos bloques lógicos inicialmente apuntan al bloque físico 0 (optimización del proyecto: nuevos lógicos hardlinkean al bloque 0 hasta que se escriban).
+Operación 2 — WRITE en el bloque lógico 1 (índice = 1), escribir 1024 bytes
+•	Contexto:
+o	meta->block_numbers[1] = 0 (apunta al físico 0)
+o	link count de block0000.dat = 4 (>=2), por lo tanto el código entra en la rama Copy-On-Write (CoW).
+•	Pasos exactos del código (write_block_file_tag):
+i.	Valida bloque_idx válido y estado != COMMITED.
+ii.	Obtiene nro_bloque_fisico_actual = meta->block_numbers[1] = 0.
+iii.	calcular links = obtener_link_count(path_fisico_actual) -> devuelve 4.
+iv.	Como links > 1 -> entra en CoW:
+	llama a reservar_bloque_fisico(fs): recorre bitmap buscando primer bit 0 libre; supongamos que encuentra el bloque físico 5 libre, lo marca (bit5 = 1), hace msync(bitmap) y devuelve nro_bloque_nuevo = 5.
+	crea/abre el archivo físico nuevo /mnt/storage/physical_blocks/block0005.dat para escritura (w+b) y copia el contenido del bloque físico actual (lectura de block0000.dat) hacia el nuevo bloque (para preservar datos no sobrescritos).
+	aplica memcpy del buffer de escritura sobre el buffer copiado en la posición correspondiente (en este caso toda la página) y escribe ese bloque completo en block0005.dat.
+	actualiza en memoria meta->block_numbers[1] = 5.
+	actualiza el hard link lógico: unlink(/.../logical_blocks/000001.dat) // borra el link viejo link(/.../physical_blocks/block0005.dat, /.../logical_blocks/000001.dat) // crea nuevo hardlink al bloque 5
+	Comprueba si el bloque físico viejo (0) quedó sin referencias: llama obtener_link_count(path_fisico_actual) otra vez. Dado que todavía existen los logical_blocks 000000.dat y 000002.dat enlazando a block0000.dat, el link count será > 1 (por ejemplo 3) y por tanto NO libera el bloque 0.
+	Si el link count hubiera quedado <= 1 (es decir, nadie más enlaza a ese físico), la función libera el bit en el bitmap con liberar_bloque_fisico(fs, nro_bloque_fisico_actual) (esto limpia el bit y msync) y además elimina la entrada correspondiente del índice blocks_hash_index.config.
+•	Estado resultante después del WRITE (CoW):
+o	meta->size sigue siendo 3072 (la operación WRITE no cambia tamaño, salvo que sea la última por encima del size; en general TRUNCATE ajusta size).
+o	meta->block_count = 3
+o	meta->block_numbers = [0, 5, 0] // ahora el bloque lógico 1 apunta al físico 5
+o	bitmap:
+	bit0 = 1 (ocupado)
+	bit5 = 1 (ocupado, recién reservado)
+	resto = 0
+o	Hardlinks y archivos en disco:
+	/mnt/storage/physical_blocks/block0000.dat : sigue existiendo y tiene logical links 000000.dat y 000002.dat apuntando a él.
+	/mnt/storage/physical_blocks/block0005.dat : nuevo archivo con contenido modificado.
+	/mnt/storage/files/myfile/BASE/logical_blocks/000001.dat -> hardlink a physical_blocks/block0005.dat (actualizado).
+o	metadata.cfg (si se guardó tras la operación) contendrá: TAMAÑO=3072 ESTADO=WORK_IN_PROGRESS BLOCKS=[0,5,0] (t_file_tag_metadata_save hace tmp + rename y msync/fflush según el código)
+Caso alternativo: WRITE directo (sin CoW)
+•	Si en vez de apuntar a un bloque físico compartido, el bloque lógico apuntara a un bloque físico con link count <= 1 (es decir, sin otros logical links), el código tomaría la rama de escritura directa:
+o	bloquearía el mutex del bloque físico correspondiente, abriría el physical file en "r+b", fseek(0) y fwrite(buffer) directamente sobre ese bloque (sin reservar otro bloque ni cambiar metadata).
+o	En ese caso meta->block_numbers y bitmap no cambian (solo cambia el contenido físico en el archivo blockNNNN.dat).
+•	Esto es más eficiente, pero solo posible cuando no hay compartición (links <= 1).
+Operación 3 — TRUNCATE a tamaño menor (achicar), por ejemplo 1024 bytes (1 bloque)
+•	Si el usuario pide achicar a 1024 bytes:
+o	Se calcula bloques_nuevos = ceil(1024/1024) = 1.
+o	achicar_file_tag / desasignar_bloques_logicos se encargan de:
+	Eliminar hard links lógicos que correspondan a índices i >= 1:
+	unlink(/.../logical_blocks/000001.dat) // este fue el que apuntaba a block0005.dat
+	unlink(/.../logical_blocks/000002.dat) // apuntaba a block0000.dat
+	Para cada bloque físico eliminado, achicar_file_tag verifica obtener_link_count(path_bloque_fisico):
+	Si link_count <= 1 (solo queda physical_blocks file), entonces llama liberar_bloque_fisico(fs, nro_bloque_fisico) para limpiar el bit en bitmap y hacer msync, y también elimina su entrada en blocks_hash_index.config.
+	Si link_count > 1, no libera el bloque físico (otro tag/file aún lo referencia).
+	Actualiza meta->block_count = 1 y realloc/free del array meta->block_numbers según corresponda; meta->size = 1024 (y se guarda metadata.cfg con t_file_tag_metadata_save).
+•	Ejemplo concreto partiendo del estado anterior ([0,5,0]):
+o	eliminar logical_blocks/000002.dat (era link a block0000.dat)
+o	eliminar logical_blocks/000001.dat (era link a block0005.dat)
+o	Para block0005.dat: tras unlink, obtener_link_count(path_bloque_fisico) probablemente = 1 (solo physical_blocks/block0005.dat) → entonces liberar_bloque_fisico marca bit5 = 0 en bitmap y se llama blocks_hash_index_remove_entry_for_block para borrar su hash del índice.
+o	Para block0000.dat: tras unlink del 000002 y 000001 ya está unlinkado por 000000.dat? En nuestro flujo, 000000.dat todavía existe, por eso link count de block0000.dat pasada la operación será >1 (por ejemplo 2: physical_blocks + logical 000000.dat), por lo tanto NO se liberará block0000.dat.
+o	Resultado final:
+	meta->block_numbers = [0]
+	meta->block_count = 1
+	meta->size = 1024
+	bitmap: bit0 = 1, bit5 = 0 (libre)
+	metadata.cfg: TAMAÑO=1024 ESTADO=WORK_IN_PROGRESS BLOCKS=[0]
+Persistencia y atomicidad (qué garantiza el código)
+•	Metadata: t_file_tag_metadata_save escribe en un archivo temporal (path + ".tmp"), hace fflush + fsync y luego rename(tmp → metadata.cfg). Esto garantiza que no se deje metadata parcialmente escrita: o está la versión vieja o la nueva completa.
+•	Bitmap: cuando el código modifica el bitarray (bitarray_set_bit / bitarray_clean_bit) hace msync(bitmap->bitarray, bitmap->size, MS_SYNC) para persistir cambios en el fichero bitmap.mmap.
+•	Bloques físicos: cuando se crean nuevos archivos físicos se escribe con fwrite y fflush; para CoW se crea un nuevo archivo blockNNNN.dat y se escribe el bloque completo, luego se unlink/link los hardlinks lógicos; liberar_bloque_fisico limpia el bit en el bitmap (persistido) para poder volver a reservar ese bloque en el futuro.
+Resumen (pasos clave y funciones involucradas)
+•	TRUNCATE (agrandar):
+o	calculo nuevos_bloques, realloc meta->block_numbers, set nuevos índices a 0 (agrandar_file_tag o asignar_bloques_logicos),
+o	crear hard links a block0000.dat para los nuevos índices,
+o	msync(bitmap) si se modificó el bit 0,
+o	t_file_tag_metadata_save para persistir TAMAÑO/BLOCKS/ESTADO.
+•	WRITE en bloque lógico:
+o	si link_count <= 1 → escritura directa en blockNNNN.dat (sin cambiar metadata/bitmap).
+o	si link_count > 1 → CoW:
+	reservar_bloque_fisico (marca bit en bitmap y msync),
+	copiar contenido, aplicar escritura, escribir nuevo blockNNNN.dat,
+	actualizar meta->block_numbers[idx] = nuevo,
+	actualizar hardlink lógico (unlink+link),
+	si el bloque viejo quedó sin referencias → liberar_bloque_fisico y remover del índice de hashes.
+o	t_file_tag_metadata_save guarda metadata si la metadata se modificó (por ejemplo, CoW cambia block_numbers).
+•	TRUNCATE (achicar):
+o	unlink de hardlinks lógicos que sobran,
+o	para cada bloque físico eliminado: si link_count <= 1 → liberar_bloque_fisico (limpiar bit), eliminar indice hash,
+o	realloc/free de meta->block_numbers y actualización de meta->size,
+o	t_file_tag_metadata_save para persistir.
+•	
+
+t_file_tag_metadata_save(path, m)
+o	Lock mutex_metadata.
+o	Formatea BLOCKS=[...] construyendo blocks_str (verifica overflow).
+o	Construye texto "TAMAÑO=...\nESTADO=...\nBLOCKS=[...]\n".
+o	Escribe en un archivo temporal path+".tmp": fopen(tmp, "w"), fwrite, fflush, fsync.
+o	rename(tmp → path) (operación atómica).
+o	Libera buffers y unlock mutex_metadata.
+o	Si falla en cualquier paso, hace log, libera recursos y desbloquea antes de retornar.
+•	asignar_bloques_logicos(meta, nuevo_tamanio, block_size, bitmap, total_blocks)
+o	Lock mutex_bitmap.
+o	Calcula nuevos_bloques = ceil(nuevo_tamanio / block_size).
+o	Si nuevos_bloques <= meta->block_count => nada que hacer, unlock y return.
+o	Asegura que bit 0 esté marcado en bitmap (bitarray_set_bit(bitmap, 0)).
+o	realloc meta->block_numbers a tamaño nuevos_bloques (si falla libera lock y retorna).
+o	Inicializa los nuevos índices con 0 (los nuevos lógicos apuntan al bloque físico 0).
+o	Actualiza meta->block_count y msync(bitmap->bitarray), unlock mutex_bitmap.
+•	desasignar_bloques_logicos(meta, nuevo_tamanio, bitmap, block_size)
+o	Lock mutex_bitmap.
+o	Calcula nuevos_bloques = ceil(nuevo_tamanio / block_size).
+o	Si nuevos_bloques >= meta->block_count => nada que hacer.
+o	Para i de nuevos_bloques a meta->block_count-1: bitarray_clean_bit(bitmap, meta->block_numbers[i]).
+o	Ajusta meta->block_count, realloc/free del array y msync(bitmap), unlock.
+•	agrandar_file_tag / achicar_file_tag
+o	agrandar_file_tag: realloc del array, para cada nuevo índice crea hard link lógico apuntando a physical_blocks/block0000.dat y pone meta->block_numbers[i]=0; actualiza meta->block_count.
+o	achicar_file_tag: unlink de hardlinks lógicos sobrantes; si el bloque físico quedó sin referencias (st_nlink <= 1) libera bloque en bitmap (liberar_bloque_fisico) y remueve entrada del índice de hashes; luego realloc/free del array y actualiza meta->block_count.
+•	write_block_file_tag(file, tag, bloque_idx, tamanio, buffer, meta, query_id)
+o	Lock mutex_metadata al inicio (protege lectura/modificación de meta).
+o	Valida índices y estado (no COMMITED).
+o	Obtiene nro_bloque_fisico_actual = meta->block_numbers[bloque_idx]; obtiene link count (stat.st_nlink).
+o	Si links <= 1 -> escritura directa:
+	lock mutexes_bloques_fisicos[nro], fopen(r+b), fwrite(buffer), fflush, unlock mutexes_bloques_fisicos[nro], unlock mutex_metadata.
+o	Si links > 1 -> CoW:
+	reservar_bloque_fisico(fs) (lock mutex_bitmap dentro), marca bit en bitmap y msync.
+	bloquear ordenado ambos mutexes de bloque físico (first/second).
+	copiar contenido del viejo bloque -> new file; aplicar memcpy del buffer y fwrite al nuevo blockNNNN.dat.
+	meta->block_numbers[bloque_idx] = nro_bloque_nuevo.
+	unlink(link lógico viejo) y link(path_nuevo, logical_path) para actualizar hardlink.
+	si antiguo bloque quedó sin referencias entonces liberar_bloque_fisico(fs, viejo) y quitar entrada del blocks_hash_index; else solo log.
+	unlock mutexes y mutex_metadata.
+o	Devuelve código de resultado; si metadata cambió, el handler llama a t_file_tag_metadata_save(path_meta, meta).
+Handlers: flujo, llamadas, locks y efectos
+1.	CREATE (handle_create)
+•	Recibe paquete con nombre_archivo, nombre_tag, query_id.
+•	Crear directorio lógico: crear_directorio_file_tag(nombre, tag) (crea files/<file>/<tag>/logical_blocks).
+•	path = path_metadata(file, tag).
+•	Si metadata ya existe: enviar ERROR_FILE_PREEXISTENTE.
+•	meta = t_file_tag_metadata_create(...) → size=0, state=WORK_IN_PROGRESS, block_numbers=NULL.
+•	t_file_tag_metadata_save(path, meta):
+o	Guarda TAMAÑO=0, ESTADO=WORK_IN_PROGRESS, BLOCKS=[] con tmp+rename y mutex_metadata.
+•	Verificación: config_create(path) y comprobación de keys; responde LISTO_OK al worker.
+•	Observaciones:
+o	CREATE no toca bitmap ni bloques físicos (size=0). El save usa mutex_metadata para evitar race con otros saves/loads.
+o	Error paths liberan recursos y devuelven códigos apropiados.
+2.	TRUNCATE (handle_truncate)
+•	Recibe file, tag, nuevo_tamanio, query_id.
+•	Valida que nuevo_tamanio sea múltiplo de block_size (salvo 0).
+•	path_meta = path_metadata(...); verifica existencia.
+•	meta = t_file_tag_metadata_create(...) y t_file_tag_metadata_load(path_meta, meta) (load usa mutex_metadata).
+•	Si meta->state == COMMITED -> error WRITE_NOT_PERMITTED.
+•	Decide:
+o	Si nuevo_tamanio > meta->size -> agrandar_file_tag(meta, nuevo_tamanio, ...):
+	realloc del array, para cada nuevo índice: set meta->block_numbers[i]=0 y creacion de hardlinks lógicos apuntando a block0000.dat
+	actualiza meta->block_count.
+	NOTA: agrandar_file_tag no toca bitmap salvo que se desee marcar bit0; en el init ya se marcó bit0.
+o	Si nuevo_tamanio < meta->size -> achicar_file_tag(meta, nuevo_tamanio...):
+	unlink de hardlinks lógicos desde nuevos_bloques hasta final, para cada bloque fisico eliminado:
+	si obtener_link_count(path_fisico) <= 1 -> liberar_bloque_fisico(fs, nro) (haz msync) y blocks_hash_index_remove_entry_for_block (con mutex_hash_index).
+	realloc/free del array y meta->block_count actualizado.
+•	meta->size = nuevo_tamanio.
+•	t_file_tag_metadata_save(path_meta, meta) -> (tmp+rename con mutex_metadata).
+•	Responde LISTO_OK.
+•	Observaciones:
+o	TRUNCATE agrupará operaciones que modifican filesystem: creación/eliminación de hardlinks (filesystem ops), modificación del bitmap (liberar_bloque_fisico), actualización del índice de hashes y finalmente persistencia de metadata.
+o	Locks: load/save usan mutex_metadata. liberar_bloque_fisico usa mutex_bitmap internamente. Cuando se llama blocks_hash_index_remove_entry_for_block se usa mutex_hash_index internamente.
+o	Error handling correcto: si un unlink o remove falla, el handler intenta continuar (logging) y responde con error solo cuando corresponde.
+3.	TAG (clonado) (handle_tag)
+•	Recibe src_file, src_tag, dst_file, dst_tag, query_id.
+•	path_src, path_dst; si dst existe → ERROR_FILE_PREEXISTENTE.
+•	meta_src = create + t_file_tag_metadata_load(path_src) (load con mutex_metadata).
+•	crear_directorio_file_tag(dst_file, dst_tag).
+•	meta_dst = create vacío; copia size, state->WORK_IN_PROGRESS, block_count y block_numbers (memcpy).
+•	t_file_tag_metadata_save(path_dst, meta_dst) — guarda metadata del tag clon (BLOCKS iguales).
+•	sincronizar_hardlinks_tag(dst_file,dst_tag, meta_dst):
+o	Para cada meta_dst->block_numbers[i] crea hard link: link(physical_blocks/blockNNNN.dat, files/dst/dst_tag/logical_blocks/%06d.dat)
+o	Ese paso asegura que los logical_blocks del nuevo tag estén creados y apunten al mismo físico (hard link), incrementando link count del físico.
+•	Responder LISTO_OK.
+•	Observaciones:
+o	Guardar metadata antes de sincronizar hardlinks es seguro porque la metadata ya refleja los bloques; sincronizar hardlinks crea los links físicos.
+o	Locks: load/save usan mutex_metadata; sincronizar_hardlinks no usa mutex_metadata pero opera sobre el FS; el orden implementado (save then sync links) es válido porque la metadata describe los links que luego se crean.
+4.	COMMIT (handle_commit)
+•	Recibe file, tag, query_id.
+•	path_meta = path_metadata(...).
+•	meta = create + t_file_tag_metadata_load(path_meta, meta) (load con mutex_metadata).
+•	Si meta->state == COMMITED -> log y responde ok.
+•	Si no:
+o	Para cada bloque lógico i:
+	pthread_mutex_lock(&mutexes_bloques_fisicos[nro_bloque_actual]) para leer seguro y calcular hash (calcular_hash_bloque usa mmap y crypto_md5), unlock.
+	buscar_nro_bloque_por_hash(hash) (usa mutex_hash_index) → si existe un bloque distinto con mismo hash:
+	hacer deduplicación: unlink(path_logico), link(path_fisico_nuevo, path_logico), meta->block_numbers[i] = nro_bloque_existente.
+	si antiguo bloque quedó sin referencias (st_nlink <=1): liberar_bloque_fisico(fs, antiguo) y blocks_hash_index_remove_entry_for_block(...) (mutex_hash_index).
+	si no existe el hash en índice: agregar_hash_a_indice(hash, nro_bloque_actual) (mutex_hash_index).
+o	meta->state = COMMITED
+o	t_file_tag_metadata_save(path_meta, meta) (mutex_metadata, tmp+rename).
+•	Responder LISTO_OK.
+•	Observaciones:
+o	COMMIT hace deduplicación por contenido. Mecanismo seguro: se bloquea cada bloque físico individual para hashear, se usa mutex_hash_index y finalmente se hace save de metadata.
+o	Mutex_metadata NO está tomado durante toda la operación (la carga y el save usan el mutex interno), por lo que puede haber pequeñas ventanas con otros actores; sin embargo las operaciones sobre hardlinks y bitmap se sincronizan con otros mutexes.
+5.	READ_BLOCK (handle_pagina_bloque)
+•	Recibe query_id, file, tag, nro_bloque_logico.
+•	path_meta -> t_file_tag_metadata_load(path_meta, meta) (load con mutex_metadata).
+•	Valida índice vs meta->block_count.
+•	nro_bloque_fisico = meta->block_numbers[nro_bloque_logico]
+•	pthread_mutex_lock(&mutexes_bloques_fisicos[nro_bloque_fisico])
+•	fopen physical file, fread block_size bytes, fclose, unlock mutex.
+•	Envia BLOCK al worker en paquete LISTO_OK con contenido.
+•	Observaciones:
+o	Lock por bloque físico evita lecturas concurrentes mientras se escribe (protección fine-grained).
+o	meta se destruye antes de leer el bloque físico, por eso no hay lock mutex_metadata durante lectura del bloque físico (la metadata fue cargada y no se modifica por la lectura). Si alguien modifica metadata después, el bloque físico es aún correcto por index.
+6.	WRITE_BLOCK (handle_write_block)
+•	Recibe file, tag, nro_bloque_logico, contenido (tamaño block_size), query_id.
+•	path_meta -> create + t_file_tag_metadata_load(path_meta, meta) (load con mutex_metadata).
+•	Valida no COMMITED y que nro_bloque_logico < meta->block_count.
+•	Llama a rc = write_block_file_tag(...):
+o	Dentro de write_block_file_tag (ver arriba): lock mutex_metadata al inicio para proteger meta, decide escritura directa (links <=1) o CoW (links>1).
+o	En CoW llama reservar_bloque_fisico(fs) que lockea mutex_bitmap, marca bit y msync; luego bloquea mutexes de ambos bloques, copia/applica buffer, actualiza meta->block_numbers[idx] y actualiza hardlink lógico (unlink+link). Luego, si el bloque viejo quedó sin referencias libera bloque y elimina del hash index (con mutexes apropiados).
+•	Si rc==0 => handler hace t_file_tag_metadata_save(path_meta, meta) para persistir la posible actualización de block_numbers (tmp+rename con mutex_metadata).
+•	Finalmente responde al worker con resultado.
+•	Observaciones:
+o	write_block_file_tag toma mutex_metadata al inicio y lo mantiene hasta el final, por eso handler no toma mutex_metadata de nuevo (pero sí hace save con mutex_metadata, que se bloqueará hasta liberar el lock dentro de write).
+o	El patrón es consistente: metadata en memoria se modifica bajo mutex_metadata; su persistencia se hace con la función save que adquiere el mismo mutex → evita race.
+7.	DELETE (handle_delete)
+•	Recibe file, tag, query_id.
+•	Protege caso special initial_file:BASE.
+•	path_meta, verifica existencia.
+•	meta = create + load (load usa mutex_metadata).
+•	Copia la lista de bloques a blocks_copy bajo pthread_mutex_lock(&mutex_metadata) (es decir hace: lock metadata, memcpy meta->block_numbers a blocks_copy y remove(path_meta) para “hacer visible” la eliminación; unlock metadata).
+•	t_file_tag_metadata_destroy(meta).
+•	Itera blocks_copy: para cada bloque lógico i:
+o	path_bloque_logico = dir_tag/logical_blocks/%06u.dat
+o	path_bloque_fisico = physical_blocks/block%04d.dat
+o	unlink(path_bloque_logico) // elimina el hardlink lógico
+o	si obtener_link_count(path_bloque_fisico) <=1 => liberar_bloque_fisico(fs, nro) y blocks_hash_index_remove_entry_for_block(...) (mutex_bitmap y mutex_hash_index internamente)
+•	Intentos de limpieza de directorios logical_blocks y tag; responde LISTO_OK.
+•	Observaciones:
+o	DELETE hace la copia de block_numbers bajo mutex_metadata para evitar races con saves/loads y para garantizar que la lista de bloques a operar esté consistente.
+o	Luego con blocks_copy fuera del mutex hace los unlink y liberaciones; liberar_bloque_fisico protegió al bitmap con mutex_bitmap.
+8.	HANDSHAKE_STORAGE (handle_handshake_storage)
+•	Recibe nombre del worker, llama agregar_worker(id, socket) que hace:
+o	Crea t_worker, duplica key socket como string, pthread_mutex_lock(&mutex_workers) y dictionary_put(diccionario_workers, strdup(key_socket), w), total_workers++ y unlock.
+•	Envía al worker HANDSHAKE_WORKER con block_size (información sobre el FS).
+•	Observaciones:
+o	No toca metadata/bitmap/bloques.
+Puntos críticos de sincronización / race conditions / garantías
+•	mutex_metadata: serializa todas las operaciones de load/save y protege modificaciones en meta en memoria. Está usado en:
+o	t_file_tag_metadata_save (lock), t_file_tag_metadata_load (lock), write_block_file_tag (lock al inicio), partes de handlers (cuando hacen load+modificar+save).
+•	mutex_bitmap: protege la estructura bitarray y msync del bitmap; usado por reservar_bloque_fisico, liberar_bloque_fisico, asignar/desasignar funciones.
+•	mutexes_bloques_fisicos[]: array de mutexes uno por cada bloque físico; usado para leer/escribir/hashear/copiar bloques y evitar deadlocks se bloquean en orden (first/second).
+•	mutex_hash_index: protege acceso al archivo blocks_hash_index.config (lectura/escritura).
+•	Orden de locks: para evitar deadlocks el código ordena según el número de bloque físico cuando necesita bloquear dos mutexes de bloque, y evita holding prolongado de mutex_metadata durante operaciones lentas (aunque write_block_file_tag sí mantiene mutex_metadata durante operaciones de CoW — esto es deliberado para mantener consistencia de la meta en memoria).
+•	Persistencia:
+o	Metadata: tmp+rename + fflush+fsync → evita metadatas parciales.
+o	Bitmap: msync(bitmap->bitarray, bitmap->size, MS_SYNC) después de set/clean.
+o	Bloques físicos: se escribe en archivos blockNNNN.dat y se hace fflush (al menos) antes de link/unlink.
+Caminos de error y limpieza
+•	En la mayoría de las funciones hay comprobaciones de malloc, fopen, ftruncate, write, rename. Si algo falla:
+o	Se loguea el error y se limpian los recursos (free, fclose, unlink tmp si corresponde).
+o	Los handlers traducen códigos internos a errores reconocidos por el protocolo (ERROR_FILE_INEXISTENTE, ERROR_ESCRITURA_NO_PERMITIDA, ERROR_FUERA_DE_LIMITE, ERROR_ESPACIO_INSUFICIENTE).
+•	Se intenta continuar cuando es seguro (por ejemplo si unlink de un logical block falla se loguea y se sigue) para no dejar la Storage en dead state; sin embargo se reportan warnings.
+Ejemplo conciso integrando handlers + funciones (TRUNCATE agrandar + WRITE CoW)
+•	Estado inicial:
+o	meta->block_numbers = [0], bitmap: bit0=1
+•	TRUNCATE -> agrandar a 3 bloques:
+o	agrandar_file_tag: realloc meta->block_numbers => [0,0,0], crea hardlinks logical_blocks/000001.dat y 000002.dat → link count block0000.dat aumento.
+o	t_file_tag_metadata_save -> escribe metadata.cfg con BLOCKS=[0,0,0] (tmp+rename).
+•	WRITE al bloque lógico 1:
+o	handle_write_block carga meta, llama write_block_file_tag.
+o	write detecta links>1 => CoW -> reservar_bloque_fisico marca bit k=5 por ej. y msync.
+o	Crea block0005.dat con copia+modificación, meta->block_numbers[1]=5, unlink logical_blocks/000001.dat y link a block0005.dat.
+o	write devuelve 0; handler llama t_file_tag_metadata_save para persistir BLOCKS=[0,5,0].
+•	Beneficio: solo el bloque modificado se duplica (CoW), los otros siguen compartiendo block0000.dat.
+Recomendaciones / mejoras posibles
+•	Reducir tiempo de hold del mutex_metadata:
+o	muchas fases de formateo (con malloc/snprint) ocurren dentro del lock de metadata; sería posible construir el texto fuera del lock y luego adquirir mutex_metadata solo para la escritura/final rename.
+o	actualmente se mantiene lock durante fsync/rename en t_file_tag_metadata_save → penaliza concurrencia.
+•	Gestionar tamaño exacto para blocks_str antes de snprintf (o usar dynamic string con realloc) en lugar de heurística cap = block_count*12 para evitar abortos si números crecen.
+•	Considerar O_TMPFILE / renameat2 o fsync del directorio (para mayores garantías en crash) si se requieren garantías más fuertes.
+•	Revisar ordering global de locks cuando combine mutex_metadata + mutexes_bloques_fisicos para evitar inversion de orden improbable.
+
+
+Visión general del filesystem
+•	Punto de montaje: hay un directorio raíz configurado (punto_montaje, p. ej. /mnt/storage) donde se crea toda la estructura del FS.
+•	Estructura en disco (principales rutas):
+o	/<punto_montaje>/physical_blocks/blockNNNN.dat — archivos que contienen datos de cada bloque físico.
+o	/<punto_montaje>/bitmap.bin — bitmap persistente (mapeado en memoria) que indica bloques libres/ocupados.
+o	/<punto_montaje>/blocks_hash_index.config — índice (hash MD5 -> blockNNNN) usado para deduplicación.
+o	/<punto_montaje>/files/<file>/<tag>/logical_blocks/<######.dat> — archivos “lógicos” por File:Tag (hard links hacia archivos en physical_blocks).
+o	/<punto_montaje>/files/<file>/<tag>/metadata.cfg — metadata del File:Tag (TAMAÑO, ESTADO, BLOCKS).
+•	Estructura en memoria principal: t_storage_fs contiene fs_size, block_size, block_count, puntero a t_bitarray (bitmap) y rutas.
+Metadata (qué es y cómo se guarda)
+•	Tipo en memoria: t_file_tag_metadata con campos:
+o	file_name, tag_name (buffers estáticos)
+o	size: tamaño en bytes del File:Tag
+o	state: WORK_IN_PROGRESS o COMMITED
+o	block_numbers: array dinámico de int → índice de bloque físico para cada bloque lógico
+o	block_count: cantidad de bloques lógicos
+•	Formato en disco (metadata.cfg):
+o	Texto con 3 claves, ejemplo: TAMAÑO=3072 ESTADO=WORK_IN_PROGRESS BLOCKS=[0,5,0]
+o	BLOCKS es un array con un entero por bloque lógico (cada número es el índice del bloque físico al que apunta).
+•	Guardado seguro: la función t_file_tag_metadata_save escribe en path+".tmp", fflush+fsync, luego rename(tmp→path) — patrón atómico para evitar metadata parcial.
+Bloques lógicos vs bloques físicos
+•	Bloque físico: unidad real de almacenamiento (archivo blockNNNN.dat, tamaño block_size).
+•	Bloque lógico: índice dentro de un File:Tag (p. ej. bloque lógico 0, 1, 2...). Cada bloque lógico está mapeado a un bloque físico mediante meta->block_numbers.
+•	Hard links: los archivos lógicos (files/.../logical_blocks/000000.dat) son hard links hacia los archivos en physical_blocks. Es decir, el mismo inode (blockNNNN.dat) puede tener múltiples enlaces lógicos desde distintos File:Tag o posiciones lógicas.
+•	Block 0: hay un bloque físico especial inicial (block0000.dat) con contenido inicial (ceros). Cuando se amplía un file sin asignar bloques reales, los nuevos bloques lógicos apuntan a block 0 (optimización para no reservar inmediatamente bloques físicos nuevos).
+Bitmap y reserva/ liberación de bloques físicos
+•	El bitmap (t_bitarray) marca para cada índice de bloque físico si está ocupado (1) o libre (0).
+•	Está mapeado (mmap) y se hace msync tras cambios para persistirlo.
+•	Reservar bloque físico:
+o	recorrer el bitmap buscando un bit 0, setearlo a 1 y msync; devuelve índice reservado.
+•	Liberar bloque físico:
+o	limpiar el bit correspondiente (set → 0) y msync.
+•	mutex_bitmap protege las operaciones sobre el bitmap.
+Copy-On-Write (CoW) y escritura
+•	Cuando se escribe en un bloque lógico:
+o	Se mira el bloque físico actual al que apunta (meta->block_numbers[idx]) y se obtiene su link count (número de hardlinks al inode).
+o	Si link count <= 1 (no compartido): escritura directa en el archivo physical_blocks/blockNNNN.dat (se abre en r+b y se sobrescribe).
+o	Si link count > 1 (bloque compartido): se hace CoW:
+a.	reservar un bloque físico libre (bitmap),
+b.	crear un nuevo archivo blockNNNN_new.dat copiando el contenido del viejo,
+c.	aplicar la escritura sobre la copia,
+d.	actualizar meta->block_numbers[idx] = nro_bloque_nuevo,
+e.	actualizar el hardlink lógico: unlink(logical_path) y link(path_nuevo, logical_path),
+f.	si el bloque antiguo quedó sin referencias, liberar su bit en el bitmap y eliminar su entrada del índice de hashes.
+•	Esto garantiza que escribir en un bloque compartido no corrompa otros tags/files que compartían ese bloque.
+Deduplicación (COMMIT)
+•	Al hacer COMMIT de un File:Tag, se calcula el hash (MD5) de cada bloque físico (se usa mmap + crypto_md5) y se busca en blocks_hash_index.config si ya existe un bloque con ese hash.
+•	Si hay un bloque distinto con el mismo hash:
+o	Se reasigna el hardlink lógico al bloque existente (unlink + link),
+o	Se actualiza meta->block_numbers para apuntar al bloque existente,
+o	Se libera el bloque viejo si quedó sin referencias y se elimina su entrada del índice de hashes.
+•	Si el hash no existe, se agrega al índice: hash=blockNNNN.
+•	Finaliza marcando meta->state = COMMITED y guardando metadata.
+Operaciones principales (resumen del flujo)
+•	CREATE:
+o	crear directorios files/<file>/<tag>/logical_blocks,
+o	crear metadata con size=0, state=WIP, BLOCKS=[] y guardarla.
+•	TRUNCATE:
+o	validar múltiplos de block_size (0 permitido),
+o	cargar metadata,
+o	si agrandar → realloc block_numbers, inicializar nuevos índices a 0 y crear hardlinks lógicos a block0000.dat (agrandar_file_tag o asignar_bloques_logicos),
+o	si achicar → unlink de los hardlinks lógicos sobrantes; para cada bloque físico “eliminado”, si quedó sin referencias liberar bitmap y eliminar hash_index; ajustar meta->block_count y guardar metadata.
+•	WRITE_BLOCK:
+o	cargar metadata, validar permisos y rango,
+o	llamar a write_block_file_tag: decide escritura directa o CoW, actualiza archivo físico y/o metadata,
+o	si metadata fue modificada (CoW) guardar metadata.cfg (tmp+rename).
+•	READ_BLOCK:
+o	cargar metadata, validar índice,
+o	abrir el block físico correspondiente y leer block_size bytes, enviarlos al requester.
+•	TAG (clonar file:tag):
+o	copiar metadata (size, block_numbers) a nuevo destino con state = WORK_IN_PROGRESS,
+o	guardar metadata destino,
+o	crear hardlinks lógicos en el nuevo directorio apuntando a los mismos bloques físicos (sin duplicar contenido).
+•	DELETE:
+o	cargar metadata, copiar lista de bloques,
+o	eliminar metadata en disco (remove(path_meta)),
+o	por cada bloque lógico unlink del hardlink lógico; si el bloque físico quedó sin referencias, liberar el bloque en bitmap y remover su hash del índice,
+o	limpiar directorios.
+•	HANDSHAKE:
+o	registrar worker en diccionario (id + socket) y enviar block_size.
+Sincronización y concurrencia
+•	mutex_metadata: protege load/save y modificaciones en la metadata en memoria. t_file_tag_metadata_load/save y write_block_file_tag usan este mutex en puntos clave.
+•	mutex_bitmap: protege operaciones sobre bitmap (set/clean + msync).
+•	mutex_hash_index: protege acceso (lectura/escritura) al archivo blocks_hash_index.config.
+•	mutexes_bloques_fisicos[]: array de mutexes, uno por bloque físico, para proteger lecturas/escrituras/hasheo de cada archivo blockNNNN.dat. Cuando se bloquean dos mutexes de bloque simultáneamente (p. ej. CoW entre bloque viejo y nuevo) el código adquiere los mutexes en orden numérico para evitar deadlocks.
+•	Patrones importantes:
+o	Guardado de metadata con tmp+rename para atomicidad.
+o	msync del bitmap para persistencia inmediata de la asignación/liberación.
+o	La persistencia de bloques físicos se hace con fwrite/fflush; en CoW se crea un archivo nuevo antes de cambiar hardlinks.
+Detalles importantes / decisiones de diseño
+•	Hard links permiten que varios File:Tag apunten al mismo bloque físico sin duplicación hasta que se escriba (share-on-read, copy-on-write on write).
+•	El bloque 0 se usa como “singleton” al agrandar sin reservar: nuevos bloques lógicos inicialmente apuntan a block0000.dat; se reserva un bloque físico real (y se actualiza el mapping) sólo cuando se escribe sobre dicho bloque y es compartido (CoW).
+•	La deduplicación (COMMIT) busca bloques con el mismo contenido (md5) y reasigna enlaces lógicos para ahorrar espacio.
+•	Metadata es el mapa lógico → físico (block_numbers), por lo tanto es la “fuente de la verdad” sobre qué bloque físico contiene cada bloque lógico.
+•	El índice de hashes (blocks_hash_index.config) mantiene mapping hash → blockNNNN usado para acelerar deduplicación.
+Ejemplo breve (flujo típico)
+•	Estado inicial: myfile:BASE size=1024, BLOCKS=[0], bit0 = 1.
+•	TRUNCATE a 3072:
+o	agranda block_count a 3, BLOCKS=[0,0,0], crea hardlinks lógicos 000001.dat y 000002.dat apuntando a block0000.dat.
+•	WRITE en bloque lógico 1:
+o	detecta block 0 compartido → reservar bloque físico libre (p. ej. 5), crear block0005.dat, copiar+escribir, actualizar BLOCKS → [0,5,0], actualizar hardlink lógico 000001.dat para que apunte a block0005.dat.
+•	COMMIT:
+o	hashea cada bloque; si encuentra bloques con mismo hash apunta ambos lógicos al mismo físico, libera los físicos sobrantes y actualiza índice.
+Posibles puntos de mejora / riesgos
+•	t_file_tag_metadata_save mantiene mutex_metadata mientras prepara y escribe el archivo (incluyendo fsync/rename), lo que puede incrementar latencia; mover parte del formateo fuera del lock reduciría bloqueo.
+•	El cálculo heurístico del tamaño del buffer para BLOCKS podría provocar fallos si los números tienen muchos dígitos; el código detecta y aborta en caso de overflow, pero podría ser más robusto con un buffer dinámico que crezca con realloc.
+•	Para mayores garantías de crash-consistency podría requerirse fsync del directorio donde se renombra el archivo (no solo del contenido) — actualmente se usa rename y fsync del FILE pero no del directorio.
+
+
+Supuestos del ejemplo
+•	punto_montaje = /mnt/storage
+•	block_size = 1024
+•	file = "myfile", tag = "BASE"
+•	Estado final que ilustraré: meta->block_numbers = [0, 5, 0], size = 3072
+•	bitmap marcado en 0 y 5 (ocupados), resto libres
+•	hardlinks: logical_blocks/*.dat son hard links a archivos en physical_blocks
+DIAGRAMA (vista simplificada)
+/mnt/storage ├─ physical_blocks/ │ ├─ block0000.dat (inode A) ← contenido inicial (ceros) │ ├─ block0001.dat (inode free) │ ├─ block0002.dat (inode free) │ ├─ block0003.dat (inode free) │ ├─ block0004.dat (inode free) │ ├─ block0005.dat (inode B) ← copia modificada (resultado de CoW) │ └─ ... ├─ bitmap.bin (mapeado en memoria) └─ files/ └─ myfile/ └─ BASE/ ├─ logical_blocks/ │ ├─ 000000.dat -> hard link to ../physical_blocks/block0000.dat (inode A) │ ├─ 000001.dat -> hard link to ../physical_blocks/block0005.dat (inode B) │ └─ 000002.dat -> hard link to ../physical_blocks/block0000.dat (inode A) └─ metadata.cfg (contenido:) TAMAÑO=3072 ESTADO=WORK_IN_PROGRESS BLOCKS=[0,5,0]
+Bitmap (visual)
+•	Representación conceptual (índices):
+índice: 0 1 2 3 4 5 6 7 ... bitmap: 1 0 0 0 0 1 0 0 ... (1 = ocupado, 0 = libre)
+Link counts (st_nlink) aproximados
+•	block0000.dat (inode A): st_nlink = 1 (physical_blocks) + 2 (000000.dat y 000002.dat) = 3
+•	block0005.dat (inode B): st_nlink = 1 (physical_blocks) + 1 (000001.dat) = 2
+Explicación del diagrama y cómo se llegó ahí (pasos resumidos)
+1.	Estado inicial (antes de agrandar/escribir)
+o	metadata.cfg tenía BLOCKS=[0], size=1024
+o	logical_blocks/000000.dat → hard link a block0000.dat (inode A)
+o	bitmap: bit0 = 1, demás 0
+2.	TRUNCATE a 3072 (agrandar a 3 bloques)
+o	Se amplía meta->block_count a 3 y se crean las entradas lógicas nuevas apuntando al bloque físico 0: meta.block_numbers = [0,0,0]
+o	Se crean hard links: logical_blocks/000001.dat → hard link a block0000.dat logical_blocks/000002.dat → hard link a block0000.dat
+o	Resultado intermedio: block0000.dat tiene st_nlink aumentado (multiples logical links).
+o	metadata.cfg guarda BLOCKS=[0,0,0]
+3.	WRITE en bloque lógico 1 (índice 1)
+o	Antes de escribir: meta->block_numbers[1] == 0 (apunta al físico 0, compartido)
+o	Se comprueba link count de block0000.dat: > 1 → hay compartición.
+o	Se hace CoW: a) reservar un bloque físico libre (ej. índice 5): bitmap marca bit5 = 1 (msync). b) crear/cargar block0005.dat copiando contenido de block0000.dat. c) aplicar la escritura sobre block0005.dat. d) actualizar meta->block_numbers[1] = 5. e) actualizar hard link lógico:
+	unlink logical_blocks/000001.dat (quita link al inode A)
+	link physical_blocks/block0005.dat → logical_blocks/000001.dat (nuevo link al inode B) f) si el bloque viejo quedara sin referencias, se liberaría el bit correspondiente; en este caso sigue referenciado (000000 + 000002), por eso no se libera block0000.
+o	metadata.cfg se actualiza a BLOCKS=[0,5,0] (save via tmp+rename).
+Qué representa cada cosa y por qué es útil
+•	physical_blocks/blockNNNN.dat
+o	Contiene los datos reales por bloque físico (tamaño block_size). Es la unidad real de almacenamiento.
+•	files/.../logical_blocks/XXXXXX.dat (hard links)
+o	Son los “vistas lógicas” dentro de cada File:Tag. No contienen una copia del contenido si apuntan al mismo físico; son hard links al physical_blocks.
+o	Ventaja: permite sharing eficiente y CoW cuando se escribe.
+•	metadata.cfg
+o	Es el mapping lógico → físico: cada entrada en BLOCKS es el índice de bloque físico que almacena el contenido del bloque lógico correspondiente.
+o	Es la “fuente de la verdad” para lecturas/escrituras.
+•	bitmap.bin
+o	Estructura (mmap) que indica qué bloques físicos están libres/ocupados. Se usa para reservar nuevos bloques físicos y para liberar cuando dejan de estar referenciados.
+o	Se msync tras cambios para persistir.
+Comportamiento en lectura y escritura (cómo usa el diagrama)
+•	READ_BLOCK (nro lógico X)
+o	metadata.cfg → meta->block_numbers[X] → obtiene nro_bloque_fisico
+o	lee physical_blocks/blockNNNN.dat y envía su contenido
+o	bloqueo por mutexes_bloques_fisicos[nro] protege acceso concurrente
+•	WRITE_BLOCK (nro lógico X)
+o	si bloque físico apuntado está compartido (st_nlink > 1) → CoW (reservar nuevo físico, copiar, escribir, cambiar hardlink y actualizar metadata)
+o	si no está compartido → escritura directa sobre el archivo physical_blocks/blockNNNN.dat
+Garantías y atomicidad
+•	Guardado metadata: escribe a path.tmp, fsync del archivo y luego rename(tmp→metadata.cfg) → evita metadatas parciales.
+•	Bitmap: modificación con msync del área mmap, para persistir la asignación.
+•	Hard links / unlink: las operaciones se coordinan con mutexes para evitar races; CoW asegura que la escritura no afecte a otros consumidores que compartían el bloque.
+Extras: cómo actúa la deduplicación (COMMIT)
+•	Durante COMMIT se calcula MD5 de cada physical block y se busca si ya existe otro bloque con ese MD5 en blocks_hash_index.config.
+•	Si existe un bloque distinto con ese hash, se reasigna el hardlink lógico para apuntar al bloque existente (ahorrando espacio). Luego se libera el bloque antiguo si queda sin referencias.
+
+
+CoW en este Storage (pasos concretos que hace el código)
+1.	El handler / write verifica a qué bloque físico apunta el bloque lógico (meta->block_numbers[idx]).
+2.	Obtiene el número de hardlinks del archivo físico (st_nlink).
+o	Si st_nlink <= 1 → no hay otra referencia: se escribe directamente en el bloque físico (sin CoW).
+o	Si st_nlink > 1 → el bloque está compartido → usar CoW.
+3.	CoW:
+o	reservar_bloque_fisico(fs) → marca un bit en el bitmap y devuelve un índice libre.
+o	crear un nuevo archivo physical_blocks/blockNNNN.dat y copiar ahí el contenido del bloque viejo.
+o	aplicar la escritura sobre esa copia.
+o	actualizar meta->block_numbers[idx] = nro_bloque_nuevo (en memoria).
+o	actualizar el hardlink lógico: unlink(logical_path) y link(path_nuevo, logical_path) (ahora el logical block apunta al nuevo bloque físico).
+o	comprobar si el bloque viejo quedó sin referencias → si es así, liberar su bit en el bitmap y eliminar su entrada del índice de hashes.
+4.	Guardar la metadata en disco (t_file_tag_metadata_save) si se modificó el mapping.
+Ventajas de CoW
+•	Eficiencia: evita copias hasta que son necesarias.
+•	Seguridad/aislamiento: escrituras no afectan a otros que comparten la misma versión.
+•	Facilita snapshots y deduplicación (puedes apuntar varios logical blocks al mismo físico).
+Desventajas y riesgos
+•	Sobrehead en escrituras compartidas: CoW hace una copia completa del bloque (lectura + escritura), así que escribir en un bloque muy compartido implica coste extra.
+•	Fragmentación: CoW puede dispersar bloques lógicos en muchos bloques físicos nuevos.
+•	Complejidad: requiere coordinación (locks) para mantener consistencia del bitmap, hardlinks y metadata.
+•	Condiciones de carrera si no se sincroniza correctamente: p. ej. dos writes concurrentes podrían reservar bloques distintos y causar inconsistencias si no hay locking correcto.
+•	Coste de I/O y uso de espacio temporal hasta que se libere el bloque viejo.
+Consideraciones prácticas / puntos de atención (en este código)
+•	El código usa st_nlink para detectar compartición; esto es simple y efectivo para hard links, pero:
+o	Debes asegurarte de que el conteo sea correcto en sistemas de archivos remotos o con comportamientos especiales.
+•	Locks:
+o	mutexes_bloques_fisicos[] para proteger lectura/escritura/hasheo de cada blockNNNN.dat.
+o	mutex_bitmap para proteger reserva/liberación de bits.
+o	mutex_metadata para proteger la estructura meta->block_numbers en memoria y su persistencia.
+o	El orden y alcance de locks reduce riesgo de deadlocks (p. ej. bloqueo ordenado de dos mutexes).
+•	Persistencia:
+o	Reservar bloque: marca el bit y hace msync del bitmap.
+o	Metadata: se guarda con tmp+rename y fsync del archivo para evitar metadatas parciales.
+o	Bloques: en CoW se escribe el nuevo archivo usando fwrite/fflush antes de cambiar los hardlinks.
+Errores típicos al depurar CoW
+•	Bloques reservados que nunca se liberan (leaks): ocurre si falla un paso tras reservar y no se libera el bit.
+•	Metadata desincronizada: si la metadata no se guarda tras actualizar block_numbers, un crash puede dejar inconsistencias.
+•	Races entre dos writers concurrentes: ambos pueden decidir hacer CoW y terminar con dos bloques distintos, si la lógica de locking/persistencia no coordina.
+•	Problemas con link counts en FS que no soportan hard links igual que ext4 (ej. algunas soluciones en red).
+Alternativas a CoW
+•	Clonar siempre (copia eager) — seguro pero costoso en espacio/tiempo.
+•	Versionado a nivel de bloque con copy-on-write pero usando estructuras que permitan más control (B+trees en ZFS/Btrfs).
+•	Deduplicación previa al commit (lo hace este repo en COMMIT: tras guardar, intenta deduplicar por hash).
+Resumen sencillo
+•	CoW = compartir hasta que alguien escribe; la primera escritura crea una copia y el escritor trabaja sobre esa copia.
+•	En el Storage: CoW protege a otros usuarios que comparten el mismo bloque físico (hard links), reservando un nuevo bloque físico, copiando, escribiendo y actualizando metadata y hardlinks.
+•	Es eficiente en lectura/duplicación y seguro, pero añade overhead a escrituras compartidas y exige correcto manejo de locks y persistencia.
+
