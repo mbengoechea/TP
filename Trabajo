@@ -1,0 +1,158 @@
+Mapeo entre consigna y el repo
+•	query_control/ → Módulo Query Control
+o	Responsabilidad según la consigna: leer archivo de query y prioridad, conectar al Master, enviar nombre del archivo_query + prioridad y esperar mensajes (lecturas o finalización). Debe registrar los logs obligatorios (conexión exitosa, envío de Query, lecturas recibidas, finalización).
+o	Qué buscar en esa carpeta:
+	Makefile + bin/query ejecutable.
+	Un main.c (o similar) que parsea args: [archivo_config] [archivo_query] [prioridad].
+	Uso de so-commons-library para logs y config (config_create, log_create, log_level_from_string).
+	Código de sockets para conectar al Master y manejo de mensajes entrantes.
+•	master/ → Módulo Master
+o	Responsabilidad según la consigna: aceptar conexiones de Query Control y Workers, asignar id autoincremental a cada Query, mantener estados READY/EXEC/EXIT, reenviar lecturas desde Workers a su Query Control, realizar planificación (FIFO y Prioridades con desalojo + aging), manejar conexiones/desconexiones y logs obligatorios.
+o	Qué buscar:
+	Makefile + bin/master.
+	Código de servidor TCP en el puerto definido por PUERTO_ESCUCHA en config.
+	Estructuras de datos para cola READY, lista de EXEC y control de workers.
+	Implementación de algoritmos de planificación (FIFO y PRIORIDADES), manejo de aging (timer/intervalos), y lógica de desalojo (solicitar PC al Worker, almacenar contexto).
+	Logs obligatorios (conexión Query Control, conexión Worker, envío/desalojo, cambios de prioridad, finalizaciones, etc.).
+•	worker/ → Módulo Worker
+o	Responsabilidad según la consigna: conectarse a Storage y luego a Master (enviando su ID), ejecutar a la vez una sola Query asignada por el Master, interpretar instrucciones del archivo de Query (CREATE, TRUNCATE, WRITE, READ, TAG, COMMIT, FLUSH, DELETE, END), tener Memoria Interna (malloc único) con paginación por demanda, pedir bloques faltantes a Storage, aplicar reemplazo (LRU o CLOCK-M), respetar RETARDO_MEMORIA, atender desalojo (persistir páginas modificadas) y logs obligatorios de memoria y ejecución.
+o	Qué buscar:
+	Makefile + bin/worker.
+	Código que hace handshake con Storage (obtener BLOCK_SIZE) y luego se conecta al Master.
+	Query Interpreter: parser de líneas del archivo de query y ejecución instrucción por instrucción respetando PC (Program Counter).
+	Módulo de Memoria Interna: malloc(TAM_MEMORIA) y tablas de páginas por File:Tag, implementación de LRU y/o CLOCK-M, manejo de fallos de página (fetch desde Storage), RETARDO_MEMORIA entre accesos.
+	Logs obligatorios: recepción de Query, FETCH/PC, asignación/liberación de marcos, memoria-miss/add, reemplazos, lecturas/escrituras físicas, desalojos.
+•	storage/ → Módulo Storage
+o	Responsabilidad según la consigna: servidor multihilo que implementa FS montado en PUNTO_MONTAJE, mantener superblock.config, bitmap.bin (bitarray real), blocks_hash_index.config (mapa hash MD5 -> blockNNNN), directorio physical_blocks con archivos blockNNNN.dat, y directorio files con cada File/Tag (metadata.config + logical_blocks con hard links a physical blocks). Operaciones: CREATE, TRUNCATE, TAG, COMMIT (deduplicación por MD5), WRITE block, READ block, DELETE tag, manejo de errores y retardos RETARDO_OPERACION/RETARDO_ACCESO_BLOQUE y logs obligatorios.
+o	Qué buscar:
+	Makefile + bin/storage.
+	Función de inicialización que lee FRESH_START y crea/formatéa estructura (superblock.config, bitmap.bin, physical_blocks, files, crear initial_file/BASE).
+	Implementación de bitmap como bitarray binario (no usar texto simple que no representen bits).
+	Uso de crypto_md5() (so-commons) para calcular hash del contenido de un bloque y actualizar blocks_hash_index.config.
+	Operaciones de lectura/escritura de bloque con bloqueo/concorrencia (servidor multihilo) y logs obligatorios por cada acción (reservado/liberado, bloque lógico leído/escrito, hard link agregado/eliminado, deduplicaciones).
+Cómo fluye el sistema (topología de ejecución)
+1.	Inicializas storage (./bin/storage config_storage) — monta/maneja el FS y escucha conexiones de Workers.
+2.	Inicias master (./bin/master config_master) — escucha Query Controls y Workers.
+3.	Inicias uno o más workers (./bin/worker config_worker <ID>) — se conectan al Storage (handshake para BLOCK_SIZE) y luego al Master (registran ID).
+4.	Inicias query control(s) (./bin/query config_query archivo_query prioridad) — se conecta al Master, envía path y prioridad y queda a la espera.
+5.	Master recibe Query Control, asigna query_id y la coloca en READY; según algoritmo la envía a un Worker libre -> Worker pasa a ejecutar la Query.
+6.	Worker abre el archivo de Query (desde PATH_QUERIES), interpreta instrucciones manteniendo PC, manipula Memoria Interna: para páginas faltantes pide bloques a Storage, realiza READs y devuelve lecturas al Master (que las reenvía al Query Control) y al final notifica END.
+7.	Si llega una Query de mayor prioridad cuando todos los Workers ocupados y ALGORITMO=PRIORIDADES, Master solicita desalojo de la Query de menor prioridad a su Worker correspondiente; Worker responde con PC y persiste páginas modificadas (FLUSH implícito antes de desalojo) y Master pone la Query desalojada en READY con contexto para reanudar.
+
+
+Visión general del repo (lo observado)
+•	Carpetas principales: master/, worker/, storage/, query_control/, utils/
+•	README.md con instrucciones generales (dependencias, compilación por módulo y uso de so-commons-library).
+•	Cada módulo se compila por separado mediante su Makefile y entrega ejecutable en bin/.
+Ahora, módulo por módulo:
+1.	Query Control
+•	Propósito funcional
+o	Enviar al Master la solicitud de ejecución de una Query (ruta/archivo) con una prioridad.
+o	Quedarse a la espera de mensajes del Master: lecturas realizadas por el Worker o aviso de finalización.
+•	Componentes esperados en la carpeta
+o	Ejecutable bin/query (o main.c + Makefile).
+o	Código para: parsear args (archivo_config, archivo_query, prioridad), leer config, crear logger.
+o	Cliente TCP que conecta al Master y maneja reconexión/recepción de mensajes.
+•	Interacciones y protocolo
+o	Al iniciar: handshake con Master (IP/PUERTO desde config).
+o	Envía: nombre/ruta del archivo_query + prioridad.
+o	Recibe: mensajes de lectura (contenido) y mensaje de fin (incluyendo motivo si hubo error).
+•	Logs mínimos (deben aparecer)
+o	Conexión exitosa al Master.
+o	Envío de la Query (archivo y prioridad).
+o	Cada lectura recibida: “Lectura realizada: File File:Tag, contenido: <CONTENIDO>”
+o	Finalización de la Query con motivo.
+•	Qué comprobar en el repo
+o	Existencia de parser de config y uso de log_level_from_string / funciones de so-commons.
+o	Implementación del socket/client connect y manejo de mensajes entrantes.
+2.	Master
+•	Propósito funcional
+o	Gestión central de Queries: recibir de Query Controls, asignar ID autoincremental, mantener estados (READY, EXEC, EXIT), planificar envío a Workers, reenviar lecturas recibidas desde Workers al Query Control correspondiente, manejar desalojo y aging.
+•	Componentes esperados
+o	Servidor TCP (escucha en PUERTO_ESCUCHA) que acepta Query Controls y Workers.
+o	Estructuras de datos: lista/cola de READY, lista de EXEC, tabla de Workers conectados, mapa id_query → conexión QueryControl/estado.
+o	Implementación de dos algoritmos de planificación: FIFO y PRIORIDADES (con desalojo y aging).
+o	Mecanismo de timers para aging (TIEMPO_AGING).
+•	Interacciones y protocolos
+o	Recibe conexión de QueryControl: asigna query_id, pone en READY.
+o	Recibe conexión de Worker: marca Worker disponible y le asigna una Query según algoritmo.
+o	Si PRIORIDADES y llega Query más importante: envía solicitud de desalojo al Worker con menor prioridad; el Worker retorna PC para reanudar luego.
+o	Reenvía mensajes de lectura desde Worker a Query Control.
+o	Maneja desconexiones: si QueryControl se desconecta cancela Query; si Worker se desconecta finaliza la Query en ejecución con error y notifica.
+•	Logs mínimos (deben aparecer)
+o	Conexión de Query Control (con path/prioridad y id).
+o	Conexión/desconexión de Worker (y cantidad total).
+o	Envío de Query a Worker.
+o	Desalojo de Query en Worker (motivo).
+o	Cambio de prioridad (aging).
+o	Finalización de Query en Worker y envío de lecturas al Query Control.
+•	Qué comprobar en el repo
+o	Código del servidor (accept loop), estructuras de colas/colas priorizadas.
+o	Implementación de desalojo (mensaje al Worker solicitando PC) y re-planificación con PC.
+o	Uso del campo TIEMPO_AGING y ALGORITMO_PLANIFICACION en el config parser.
+3.	Worker
+•	Propósito funcional
+o	Ejecutar una sola Query a la vez enviada por el Master; interpretar instrucciones de Query (CREATE, TRUNCATE, WRITE, READ, TAG, COMMIT, FLUSH, DELETE, END).
+o	Mantener Memoria Interna con paginación por demanda, pedir páginas faltantes al Storage, aplicar algoritmo de reemplazo (LRU o CLOCK-M), respetar RETARDO_MEMORIA y manejar desalojos.
+•	Componentes esperados
+o	Cliente TCP que primero hace handshake con Storage (obtiene BLOCK_SIZE) y posteriormente se conecta al Master registrando su ID.
+o	Query Interpreter: abrir archivo de Query desde PATH_QUERIES, parsear línea por línea, mantener Program Counter (PC).
+o	Memoria Interna: un único malloc(TAM_MEMORIA), tablas de páginas por File:Tag, mecanismos de page-fault y fetch de bloques desde Storage.
+o	Implementación de algoritmos de reemplazo: LRU y/o CLOCK-M (seleccionado por ALGORITMO_REEMPLAZO).
+o	Manejo de RETARDO_MEMORIA (espera por cada acceso).
+o	Manejo de desalojo: menerima petición del Master, flush de páginas modificadas al Storage y retorno del PC.
+•	Interacciones y protocolos
+o	Handshake Storage ↔ Worker para obtener tamaño de bloque.
+o	Master ↔ Worker: asignación de Query, solicitud de desalojo, recepción de PC para reanudar.
+o	Worker ↔ Storage: operaciones de lectura/escritura de bloques lógicos, TAG, CREATE, TRUNCATE, COMMIT, DELETE, etc.
+o	Worker → Master → QueryControl: envía lecturas efectuadas.
+•	Logs mínimos (deben aparecer)
+o	Recepción de Query y path.
+o	FETCH de instrucción con Program Counter.
+o	Instrucción realizada.
+o	Desalojo solicitado por Master.
+o	Lectura/Escritura física en Memoria (dirección física y valor).
+o	Asignación y liberación de marcos, memoria-miss/add, reemplazos de páginas.
+•	Qué comprobar en el repo
+o	Implementación del malloc único y estructura de tablas de páginas.
+o	Funciones de fetch y write que contactan Storage cuando faltan páginas.
+o	Parser e interpreter de instrucciones y respeto de delays RETARDO_MEMORIA.
+o	Mecanismo de serialización de contexto (PC y páginas sucias) en desalojo.
+4.	Storage
+•	Propósito funcional
+o	Implementar el File System que atiende peticiones de Workers: mantener superblock.config, bitmap.bin (bitarray real), blocks_hash_index.config (MD5->bloque físico), physical_blocks (archivos blockNNNN.dat) y files (File/Tag con metadata.config + logical_blocks como hard links).
+o	Operaciones: CREATE, TRUNCATE, TAG, COMMIT (con deduplicación mediante MD5), WRITE bloque (copy-on-write si bloque referenciado), READ bloque, DELETE tag, manejo de errores (file/tag inexistente, permiso de escritura, espacio insuficiente).
+•	Componentes esperados
+o	Servidor multihilo que atiende conexiones de Workers (PUERTO_ESCUCHA).
+o	Inicialización con FRESH_START: crear estructura de FS, superblock y primer initial_file/BASE con bloque 0 lleno de '0'.
+o	Implementación del bitmap como bitarray persistido (bitmap.bin) — obligatorio como bitarray (no texto plano que no represente bits).
+o	blocks_hash_index.config actualizado con crypto_md5() para deduplicar bloques.
+o	Operaciones de bloqueo/concorrencia y retardos: RETARDO_OPERACION por petición y RETARDO_ACCESO_BLOQUE por cada bloque leído/escrito.
+•	Interacciones y protocolos
+o	Workers conectan y realizan solicitudes de operación (lectura de bloque lógico, escritura de bloque lógico, crear tag, truncar, commit, delete).
+o	Para escritura: si bloque físico referenciado por varios logical_blocks, se debe buscar nuevo bloque físico (copy-on-write).
+o	Para commit: buscar por hash MD5 en blocks_hash_index y reapuntar o agregar hash.
+•	Logs mínimos (deben aparecer)
+o	Conexión/desconexión de Worker.
+o	File creado, truncado, tag creado, commit, tag eliminado.
+o	Bloque lógico leído/escrito, bloque físico reservado/liberado, hard link agregado/eliminado, deduplicación de bloques.
+•	Qué comprobar en el repo
+o	Código de inicialización usando FRESH_START y creación del initial_file/BASE.
+o	Implementación de bitmap como bitarray en archivo binario.
+o	Uso de crypto_md5() (so-commons) y manejo persistente de blocks_hash_index.config.
+o	Creación de hard links para logical_blocks que apunten a physical_blocks/blockNNNN.dat.
+5.	utils (código compartido)
+•	Propósito funcional
+o	Contener utilidades compartidas entre módulos: serialización de mensajes, estructuras de protocolo, funciones comunes de logging/config, manejo de sockets, funciones de ayuda para File:Tag (parseo) o manejo de listas/colas si no se usa directamente so-commons.
+•	Qué comprobar en el repo
+o	Implementaciones de serializadores/deserializadores de mensajes usados entre Master/Worker/QueryControl/Storage.
+o	Funciones auxiliares reutilizadas en varios módulos (p. ej. parseo de paths, creación de estructuras, wrappers de sockets).
+Comportamiento global y flujo (resumen operativo)
+1.	Lanzás storage (monta FS, escucha).
+2.	Lanzás master (escucha conexiones).
+3.	Lanzás workers (se conectan a storage y luego a master).
+4.	Lanzás query_controls (envían path/prioridad al master).
+5.	Master planifica y asigna queries a workers (FIFO o PRIORIDADES con desalojo + aging).
+6.	Worker interpreta instrucciones, usa Memoria Interna paginada y consulta a Storage para bloques faltantes; envía lecturas al Master, que las reenvía al Query Control.
+7.	Commit / Flush / Desalojo / Errores se manejan según la consigna y los logs deben reflejar cada operación obligatoria.
+
